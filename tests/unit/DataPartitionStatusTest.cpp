@@ -402,5 +402,41 @@ int main() {
         }
     }
 
+    // ---- Scope boundary, confirmed directly against the implementation:
+    // DataPartitionStatus has NO concept of tensor shape/size anywhere --
+    // declared_schema_ tracks dtype only (Option B, see
+    // docs/SCHEMA_VALIDATION.md), and update_production_status() doesn't
+    // even take a dtype parameter, let alone re-validate one. The actual
+    // dtype-consistency enforcement is validate_field(), called
+    // EXTERNALLY by Client/Server *before* a write reaches storage --
+    // DataPartitionStatus itself provides no automatic protection once a
+    // schema is declared; it only reports a conflict if validate_field()
+    // happens to be called again with a mismatched dtype. Calling
+    // update_production_status() repeatedly for the same field, with no
+    // validate_field() calls in between at all, succeeds unconditionally
+    // every time -- there is nothing here to catch a caller that forgets
+    // to validate. A real tensor *shape* mutation (same dtype, different
+    // size) is entirely invisible at this layer; see
+    // tests/unit/StorageManagerTest.cpp for where that's actually
+    // observable (SimpleStorageManager, which holds the real tensors). ----
+    {
+        tq::DataPartitionStatus p("p1");
+        p.declare_schema({{"reward", tq::FieldDtype::Float32}});
+
+        // No validate_field() call at all between these -- nothing stops
+        // it, because nothing here is responsible for stopping it.
+        CHECK_NOTHROW(p.update_production_status({1}, {"reward"}));
+        CHECK_NOTHROW(p.update_production_status({2}, {"reward"}));
+        CHECK_NOTHROW(p.update_production_status({1}, {"reward"})); // same id again, still no-op-safe
+
+        // The conflict only ever surfaces through validate_field() or a
+        // conflicting declare_schema() call -- both already covered above
+        // -- never through update_production_status() itself.
+        CHECK_THROWS(p.validate_field("reward", tq::FieldDtype::Int64), std::invalid_argument);
+        // ...but update_production_status() for the same field still has
+        // no opinion and still succeeds -- it was never asked to check.
+        CHECK_NOTHROW(p.update_production_status({3}, {"reward"}));
+    }
+
     return tq::test::summary("DataPartitionStatusTest");
 }

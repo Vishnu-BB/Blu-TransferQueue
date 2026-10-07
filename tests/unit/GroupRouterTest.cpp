@@ -137,5 +137,39 @@ int main() {
         CHECK(same_rank_count < total_pairs / 2);
     }
 
+    // Skewed group_id distribution: GroupRouter makes no load-balancing
+    // promise, only a per-group_id CONSISTENCY promise (same group_id ->
+    // same rank, always). A workload where one "hot" group dominates (e.g.
+    // a long prompt producing far more rollouts than its peers) is exactly
+    // where that promise matters most -- confirm it holds regardless of how
+    // skewed the calling pattern is, not just under the earlier tests'
+    // evenly-varied inputs.
+    {
+        tq::GroupRouter router(16);
+
+        // One group_id queried 10000 times in a row (simulating a hot
+        // prompt's rollouts arriving one at a time) must land on the exact
+        // same rank every time.
+        int hot_rank = router.target_rank("hot-prompt");
+        for (int i = 0; i < 10000; ++i) {
+            CHECK(router.target_rank("hot-prompt") == hot_rank);
+        }
+
+        // Adversarial skew: 5 real group_ids, queried with wildly unequal
+        // frequency (one dominates 95% of calls) interleaved with the
+        // others -- every call for a given group_id must still agree with
+        // that group_id's own fixed rank, regardless of call order or how
+        // rarely a given id is interleaved in.
+        const std::vector<std::string> real_groups = {"prompt-a", "prompt-b", "prompt-c", "prompt-d", "prompt-e"};
+        std::vector<int> expected_rank;
+        for (const auto& g : real_groups) expected_rank.push_back(router.target_rank(g));
+
+        for (int i = 0; i < 2000; ++i) {
+            // Group 0 ("prompt-a") dominates; the rest appear rarely.
+            int idx = (i % 20 == 0) ? static_cast<int>(1 + (i / 20) % 4) : 0;
+            CHECK(router.target_rank(real_groups[idx]) == expected_rank[idx]);
+        }
+    }
+
     return tq::test::summary("GroupRouterTest");
 }

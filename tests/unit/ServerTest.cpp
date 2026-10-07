@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -299,6 +300,57 @@ int main() {
         auto ready_a_only = h.client.get("gap", {"a"}, "trainer", 10);
         CHECK(ready_a_only.size() == 1);
         CHECK(ready_a_only.at(1).count("a") == 1);
+    }
+
+    // ---- Abrupt client disconnect mid-transfer: a client sends a request
+    // then closes its socket (and context) before ever reading the reply.
+    // The server's ROUTER socket writes the reply keyed by the DEALER's
+    // identity frame; with no ZMQ_ROUTER_MANDATORY set, a send to a
+    // vanished peer is simply dropped, not an error the request-loop thread
+    // has to handle -- confirm that holds in practice: the server must not
+    // crash or hang, and must still serve a brand new client afterward. ----
+    {
+        Harness h;
+        h.client.declare_schema("p@disconnect", {{"reward", tq::FieldDtype::Float32}});
+
+        {
+            zmq::context_t ctx;
+            zmq::socket_t dealer(ctx, zmq::socket_type::dealer);
+            dealer.connect(h.address);
+
+            tq::MessageBody body;
+            body.partition_id = "p@disconnect";
+            tq::Record r;
+            r["reward"] = make_scalar_f32(1.0f);
+            body.payload = tq::serialize_batch({{1, r}});
+            body.sample_ids = {1};
+            body.fields = {"reward"};
+            auto request = tq::Message::create(tq::RequestType::PUT_DATA, "vanishing", body);
+            auto bytes = request.serialize();
+            dealer.send(zmq::buffer(bytes), zmq::send_flags::none);
+            // Socket and context destroyed here, with no recv() -- the
+            // reply the server is about to send has nowhere to land.
+        }
+
+        // Give the request loop a moment to actually process the request
+        // and attempt (and drop) its reply before checking the server is
+        // still alive.
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        // Server must still be fully responsive to a fresh client.
+        CHECK_NOTHROW(h.client.handshake());
+        tq::Record r2;
+        r2["reward"] = make_scalar_f32(2.0f);
+        CHECK_NOTHROW(h.client.put("p@disconnect", {"reward"}, {{2, r2}}));
+        auto got = h.client.get("p@disconnect", {"reward"}, "trainer", 10);
+        // The vanished client's own write (sample 1) still completed
+        // server-side -- only its reply was undeliverable, the request
+        // itself was fully processed before that -- so both samples show
+        // up here, which is itself confirmation the server kept working
+        // normally through the disconnect rather than wedging on it.
+        CHECK(got.size() == 2);
+        CHECK(got.count(1) == 1);
+        CHECK(got.count(2) == 1);
     }
 
     return tq::test::summary("ServerTest");

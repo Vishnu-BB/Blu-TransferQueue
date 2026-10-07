@@ -51,7 +51,7 @@ CUDA_LIB  := $(CUDA_HOME)lib64
 CORE_SRCS := src/BatchMeta.cpp src/Message.cpp src/PartitionIndexManager.cpp src/DataPartitionStatus.cpp \
              src/Controller.cpp src/Sampler.cpp src/GRPOGroupNSampler.cpp src/GroupRouter.cpp
 
-.PHONY: smoke test_tensor test_rpc test_distributed test_distributed_n_to_m server_bin controller_server_bin storage_server_bin demo_pipeline unit_tests deps lib clean
+.PHONY: smoke test_tensor test_rpc test_correctness test_distributed test_distributed_n_to_m server_bin controller_server_bin storage_server_bin demo_pipeline unit_tests deps lib clean
 
 smoke: $(BUILD_DIR)/test_scaffold_smoke
 	./$(BUILD_DIR)/test_scaffold_smoke
@@ -93,6 +93,16 @@ test_rpc: $(BUILD_DIR)/test_rpc_smoke
 $(BUILD_DIR)/test_rpc_smoke: $(RPC_TEST_SRCS)
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(TENSOR_INCLUDES) -DWITH_CUDA $(RPC_TEST_SRCS) $(TENSOR_LDFLAGS) $(TENSOR_LDLIBS) $(RPC_LDLIBS) -o $@
+
+# ---- End-to-End Pipeline Correctness Test ----
+CORRECTNESS_TEST_SRCS := $(CORE_SRCS) $(TENSOR_SRCS) $(RPC_SRCS) tests/test_pipeline_correctness.cpp
+
+test_correctness: $(BUILD_DIR)/test_pipeline_correctness
+	./$(BUILD_DIR)/test_pipeline_correctness
+
+$(BUILD_DIR)/test_pipeline_correctness: $(CORRECTNESS_TEST_SRCS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(TENSOR_INCLUDES) -DWITH_CUDA $(CORRECTNESS_TEST_SRCS) $(TENSOR_LDFLAGS) $(TENSOR_LDLIBS) $(RPC_LDLIBS) -o $@
 
 # ---- Lane 4 (test_distributed): write-time group-affinity routing across
 #      real MPI ranks. Needs mpic++ + `mpirun -np N` on top of Lane 3's

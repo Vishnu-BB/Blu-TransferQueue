@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <stdexcept>
+#include <thread>
 
 #include "core/Tensor.h"
 #include "transferqueue/Controller.h"
@@ -191,6 +192,48 @@ int main() {
         auto got_a_only = client->get("gap", {"a"}, "trainer", 10);
         CHECK(got_a_only.size() == 1);
         CHECK(got_a_only.at(1).count("a") == 1);
+    }
+
+    // ---- Thread safety: multiple threads sharing ONE TransferQueueClient
+    // instance. Client itself holds no state of its own beyond the three
+    // shared_ptrs (Controller, StorageManager, sampler) -- Controller
+    // serializes every call behind its own single mutex (see Controller.h),
+    // and SimpleStorageManager has its own mutex too, so a single Client
+    // shared across threads should be exactly as safe as each thread
+    // holding its own Client pointed at the same collaborators. Each thread
+    // uses its own partition to avoid legitimate (non-bug) contention over
+    // which thread's put "wins" a shared batch. ----
+    {
+        auto client = make_client();
+        constexpr int kThreads = 8;
+        constexpr int kSamplesPerThread = 200;
+        std::vector<std::thread> threads;
+        std::vector<char> thread_ok(kThreads, 0);
+
+        for (int t = 0; t < kThreads; ++t) {
+            threads.emplace_back([&, t]() {
+                std::string partition = "thread-client-" + std::to_string(t);
+                bool ok = true;
+                for (int i = 0; i < kSamplesPerThread; ++i) {
+                    tq::Record r;
+                    r["reward"] = make_f32(static_cast<float>(t));
+                    try {
+                        client->put(partition, {"reward"}, {{static_cast<tq::SampleId>(i), r}});
+                    } catch (...) {
+                        ok = false;
+                    }
+                }
+                auto got = client->get(partition, {"reward"}, "trainer", kSamplesPerThread);
+                ok = ok && (got.size() == static_cast<std::size_t>(kSamplesPerThread));
+                for (const auto& [id, record] : got) {
+                    (void)id;
+                    ok = ok && (static_cast<const float*>(record.at("reward").data())[0] == static_cast<float>(t));
+                }
+                thread_ok[t] = ok ? 1 : 0;
+            });
+        }
+        for (auto& th : threads) th.join();
+        for (int t = 0; t < kThreads; ++t) CHECK(thread_ok[t] == 1);
     }
 
     return tq::test::summary("ClientTest");

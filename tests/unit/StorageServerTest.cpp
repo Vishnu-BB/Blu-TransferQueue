@@ -5,9 +5,12 @@
 
 #include "transferqueue/StorageServer.h"
 
+#include <chrono>
+#include <future>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <zmq.hpp>
@@ -284,6 +287,54 @@ int main() {
 
         server_a.stop();
         server_b.stop();
+    }
+
+    // ---- The oversized-write deadlock fix (see
+    // tests/unit/StorageManagerTest.cpp) applies over the real wire path
+    // too: a single PUT_DATA batch exceeding the shard's capacity_bytes
+    // must get a clean REQUEST_ERROR reply, never hang the server. Bounded
+    // wait on the client call itself is the real safety net here -- a
+    // regression would otherwise hang this whole test binary waiting on
+    // recv(). ----
+    {
+        auto storage = std::make_shared<tq::SimpleStorageManager>(/*capacity_bytes=*/8);
+        tq::StorageServer server("shard", 0, storage);
+        std::string addr = server.start("tcp://127.0.0.1:0");
+        tq::TransferQueueRpcClient client("client", addr);
+
+        tq::Record oversized;
+        oversized["reward"] = make_token_ids({1, 2}); // 16 bytes -- exceeds the 8-byte capacity on its own
+
+        std::promise<bool> threw;
+        auto threw_future = threw.get_future();
+        std::thread caller([&client, oversized, p = std::move(threw)]() mutable {
+            bool did_throw = false;
+            try {
+                client.put("rollout@oversized", {"reward"}, {{1, oversized}});
+            } catch (const std::exception&) {
+                did_throw = true;
+            }
+            p.set_value(did_throw);
+        });
+        bool returned_promptly = threw_future.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+        CHECK(returned_promptly); // must come back as a clean error, never hang
+        if (returned_promptly) {
+            CHECK(threw_future.get()); // RpcClient surfaces the server's REQUEST_ERROR as an exception
+            caller.join();
+        } else {
+            caller.detach(); // avoid hanging the test binary on a real regression
+        }
+        CHECK(storage->current_bytes() == 0); // the oversized write must not have partially landed
+
+        // The server must still be alive and correctly serving requests
+        // afterward -- a thrown handler exception must not have taken the
+        // request loop down.
+        tq::Record fits;
+        fits["reward"] = make_token_ids({1}); // 8 bytes -- exactly fits
+        CHECK_NOTHROW(client.put("rollout@oversized", {"reward"}, {{2, fits}}));
+        CHECK(storage->current_bytes() == 8);
+
+        server.stop();
     }
 
     return tq::test::summary("StorageServerTest");

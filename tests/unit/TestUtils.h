@@ -44,7 +44,7 @@ inline int summary(const char* suite_name) {
     return 1;
 }
 
-}::test
+} 
 
 #define CHECK(cond) ::tq::test::record_check(static_cast<bool>(cond), #cond, __FILE__, __LINE__)
 

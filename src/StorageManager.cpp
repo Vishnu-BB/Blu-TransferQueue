@@ -74,6 +74,17 @@ void SimpleStorageManager::put_data(const BatchMeta& meta, const std::unordered_
 
     std::unique_lock<std::mutex> lock(mutex_);
     if (capacity_bytes_ > 0) {
+        // A single batch whose own byte size already exceeds the total
+        // capacity can NEVER satisfy the wait predicate below, even at
+        // current_bytes_ == 0 -- waiting would block forever, not just
+        // until space frees up. Reject immediately instead of deadlocking
+        // the caller. Confirmed as a real bug via external review, not
+        // assumed; see docs/UNIT_TEST_FINDINGS.md.
+        if (incoming_bytes > capacity_bytes_) {
+            throw std::invalid_argument("SimpleStorageManager::put_data: batch of " +
+                                         std::to_string(incoming_bytes) + " bytes exceeds total capacity of " +
+                                         std::to_string(capacity_bytes_) + " bytes -- can never fit, even empty");
+        }
         space_available_.wait(lock, [&] { return current_bytes_ + incoming_bytes <= capacity_bytes_; });
     }
 

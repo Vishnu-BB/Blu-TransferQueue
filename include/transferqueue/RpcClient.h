@@ -14,6 +14,15 @@ namespace tq {
 // different transport -- a rollout engine, agent loop, or training engine
 // wiring into TransferQueue over the network uses this, not
 // TransferQueueClient directly.
+//
+// NOT thread-safe: a single instance wraps one ZMQ DEALER socket, and ZMQ
+// sockets must only ever be used from the thread that owns them -- calling
+// any method concurrently from multiple threads on the SAME instance is
+// undefined behavior (e.g. two threads' requests interleaving on the wire,
+// or a thread reading the reply meant for another thread's call), not
+// something this class detects or guards against. Give each thread its own
+// instance, or serialize all access to a shared one externally (e.g. one
+// mutex held around every call) -- this class does neither for you.
 class TransferQueueRpcClient {
 public:
     // Forward-declared here (not private) only so RpcClient.cpp's free

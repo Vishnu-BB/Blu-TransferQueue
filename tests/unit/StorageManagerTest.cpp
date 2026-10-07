@@ -166,6 +166,36 @@ int main() {
         CHECK(mgr.current_bytes() == 0);
     }
 
+    // ---- Runtime mutation of an existing field with a DIFFERENT DTYPE
+    // (not just a different size/shape, which the test above already
+    // covers): SimpleStorageManager::put_data() has no shape/dtype
+    // consistency check at all -- `row[field] = value;` unconditionally
+    // overwrites, regardless of what was there before. Confirmed real,
+    // documented here rather than assumed. (The dtype-consistency
+    // enforcement this project actually has -- Option B schema validation,
+    // see docs/SCHEMA_VALIDATION.md -- lives one layer up, at
+    // Controller::validate_schema()/DataPartitionStatus::validate_field(),
+    // called by Client/Server *before* reaching this method; it is not
+    // SimpleStorageManager's own job to re-check it, and nothing here
+    // does.) ----
+    {
+        tq::SimpleStorageManager mgr;
+        tq::BatchMeta meta({1}, {"p"}, {"x"});
+
+        tq::Record as_int;
+        as_int["x"] = make_i64({42}); // Int64, 8 bytes
+        mgr.put_data(meta, {{1, as_int}});
+        CHECK(mgr.get_data(meta).at(1).at("x").dtype() == Dtype::Int64);
+
+        tq::Record as_float;
+        as_float["x"] = make_f32({1.0f, 2.0f, 3.0f}); // Float32, 12 bytes -- different dtype AND shape
+        CHECK_NOTHROW(mgr.put_data(meta, {{1, as_float}})); // succeeds unconditionally, no validation
+        auto& overwritten = mgr.get_data(meta).at(1).at("x");
+        CHECK(overwritten.dtype() == Dtype::Float32); // the new dtype fully replaced the old
+        CHECK(overwritten.numel() == 3);
+        CHECK(mgr.current_bytes() == 12); // byte accounting still correct across the dtype change
+    }
+
     // ---- get_data/clear_data for an id that was never written: must not
     //      crash, and must not fabricate an entry ----
     {
@@ -278,6 +308,56 @@ int main() {
         } else {
             writer2.detach(); // avoid hanging the test binary on a real regression
         }
+    }
+
+    // ---- FIXED (was a real deadlock -- confirmed via external review,
+    //      not assumed, see docs/UNIT_TEST_FINDINGS.md): a single batch
+    //      whose own byte size exceeds total capacity_bytes used to block
+    //      forever in put_data's wait() -- the predicate
+    //      (current_bytes_ + incoming_bytes <= capacity_bytes_) can never
+    //      be true, even at current_bytes_ == 0, so no clear_data() could
+    //      ever wake it. Now rejected immediately instead. Bounded wait
+    //      here too, defense in depth: a real regression fails this CHECK
+    //      instead of hanging the whole binary. ----
+    {
+        auto mgr = std::make_shared<tq::SimpleStorageManager>(/*capacity_bytes=*/8);
+        tq::BatchMeta meta({200}, {"p"}, {"x"});
+        tq::Record r;
+        r["x"] = make_i64({1, 2}); // 16 bytes -- exceeds the 8-byte total capacity on its own
+
+        std::promise<void> p;
+        auto f = p.get_future();
+        std::thread writer([mgr, meta, r, p = std::move(p)]() mutable {
+            try {
+                mgr->put_data(meta, {{200, r}});
+            } catch (...) {
+                // swallow -- the test thread checks via the exception
+                // re-thrown below, this thread only needs to prove it
+                // returned promptly rather than hanging.
+            }
+            p.set_value();
+        });
+        bool returned_promptly = f.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        CHECK(returned_promptly); // must reject immediately, never hang
+        if (returned_promptly) {
+            writer.join();
+        } else {
+            writer.detach(); // avoid hanging the test binary on a real regression
+        }
+        CHECK(mgr->current_bytes() == 0); // the oversized write must not have partially landed
+
+        // Confirmed on the calling thread too (no concurrency involved):
+        // throws synchronously, not just "eventually returns" via some
+        // other path.
+        CHECK_THROWS(mgr->put_data(meta, {{200, r}}), std::invalid_argument);
+
+        // A batch that exactly equals capacity must still succeed (the
+        // fix's boundary: > capacity_bytes_ rejects, == does not).
+        tq::BatchMeta meta_exact({201}, {"p"}, {"x"});
+        tq::Record r_exact;
+        r_exact["x"] = make_i64({1}); // 8 bytes -- exactly the capacity
+        CHECK_NOTHROW(mgr->put_data(meta_exact, {{201, r_exact}}));
+        CHECK(mgr->current_bytes() == 8);
     }
 
     // ---- capacity_bytes=0 is genuinely unbounded: a synchronous put of a

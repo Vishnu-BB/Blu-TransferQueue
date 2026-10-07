@@ -124,5 +124,51 @@ int main() {
         CHECK(m2.is_ready());
     }
 
+    // ---- Duplicate sample_ids within a single batch: NOT rejected by the
+    // constructor (it only checks array LENGTHS match, never uniqueness of
+    // VALUES within sample_ids). Documents the actual, current behavior
+    // rather than assuming a uniqueness invariant that doesn't exist here
+    // -- BatchMeta is a plain addressing struct, and nothing downstream
+    // that was checked (StorageManager's map-keyed storage) is corrupted
+    // by a duplicate, just redundant. Production_status can legitimately
+    // disagree between the two listed occurrences of the same id (array
+    // position, not id identity, is what production_status is indexed
+    // by) -- that asymmetry is a real, confirmed consequence worth
+    // pinning down explicitly. ----
+    {
+        // Same id (7) listed twice, with DIFFERENT production_status
+        // entries at each position -- constructor accepts this silently.
+        CHECK_NOTHROW(tq::BatchMeta({7, 7}, {"p", "p"}, {}, {true, false}));
+        tq::BatchMeta dup({7, 7}, {"p", "p"}, {}, {true, false});
+        CHECK(dup.sample_ids.size() == 2);
+        CHECK(dup.sample_ids[0] == 7 && dup.sample_ids[1] == 7);
+        // is_ready() scans production_status positionally, not by unique
+        // id -- the second (false) entry makes the whole batch not ready,
+        // even though "sample 7" also appears as "produced" at position 0.
+        CHECK(!dup.is_ready());
+
+        // All duplicates, all produced -> ready (positional scan, every
+        // position is true regardless of id repetition).
+        tq::BatchMeta dup_ready({3, 3, 3}, {"p", "p", "p"}, {}, {true, true, true});
+        CHECK(dup_ready.is_ready());
+    }
+
+    // ---- Empty field name strings in `fields`: NOT rejected. `fields` has
+    // no length relationship to sample_ids (confirmed by an earlier test in
+    // this file) and no per-element validation at all -- an empty string is
+    // just another string as far as the constructor is concerned. ----
+    {
+        CHECK_NOTHROW(tq::BatchMeta({1}, {"p"}, {""}, {}));
+        tq::BatchMeta m({1}, {"p"}, {"", "reward", ""}, {});
+        CHECK(m.fields.size() == 3);
+        CHECK(m.fields[0].empty());
+        CHECK(m.fields[1] == "reward");
+        CHECK(m.fields[2].empty());
+        // Doesn't affect is_ready() at all -- `fields` plays no role in
+        // readiness, only `production_status` does.
+        tq::BatchMeta ready_with_empty_field({1}, {"p"}, {""}, {true});
+        CHECK(ready_with_empty_field.is_ready());
+    }
+
     return tq::test::summary("BatchMetaTest");
 }

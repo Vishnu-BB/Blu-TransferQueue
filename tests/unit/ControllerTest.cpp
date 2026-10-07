@@ -13,6 +13,7 @@
 // dedicated test files, not re-proven here.
 
 #include "transferqueue/Controller.h"
+#include "transferqueue/GRPOGroupNSampler.h"
 
 #include <algorithm>
 #include <optional>
@@ -328,6 +329,41 @@ int main() {
                 CHECK(controller.shard_for_sample(partition, static_cast<tq::SampleId>(i)) == t);
             }
         }
+    }
+
+    // ---- GRPO group completeness has NO policy_version requirement: a
+    // group can be selected as complete even when its members were
+    // produced under different policy versions. select_and_consume() only
+    // resolves/forwards group_id to the sampler (see its own doc above);
+    // version_for_sample() is tracked separately and never consulted here
+    // or inside GRPOGroupNSampler::sample() (confirmed: its signature takes
+    // ready_ids/group_ids only, no version array at all). Any
+    // version-skew filtering is a policy decision for a caller/future
+    // sampler to make on top of this, not something the current plumbing
+    // enforces. ----
+    {
+        tq::TransferQueueController controller;
+        controller.create_partition("p1");
+        tq::GRPOGroupNSampler sampler(/*n_samples_per_prompt=*/3);
+
+        // Same group_id ("prompt-1"), produced across three different
+        // policy versions.
+        controller.update_production_status("p1", {1}, {"reward"}, /*shard_index=*/std::nullopt, "prompt-1");
+        controller.advance_version();
+        controller.update_production_status("p1", {2}, {"reward"}, /*shard_index=*/std::nullopt, "prompt-1");
+        controller.advance_version();
+        controller.update_production_status("p1", {3}, {"reward"}, /*shard_index=*/std::nullopt, "prompt-1");
+
+        CHECK(controller.version_for_sample("p1", 1) == 0);
+        CHECK(controller.version_for_sample("p1", 2) == 1);
+        CHECK(controller.version_for_sample("p1", 3) == 2);
+
+        // Despite the version skew, the group is still complete (3 of 3)
+        // and select_and_consume() selects and consumes it in full.
+        auto selected = controller.select_and_consume("p1", {"reward"}, "trainer", sampler, /*batch_size=*/3);
+        CHECK(selected.size() == 3);
+        CHECK(contains(selected, 1) && contains(selected, 2) && contains(selected, 3));
+        CHECK(controller.ready_indexes("p1", {"reward"}, "trainer").empty());
     }
 
     return tq::test::summary("ControllerTest");
