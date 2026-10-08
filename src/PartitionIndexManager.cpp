@@ -14,14 +14,12 @@ std::vector<SampleId> PartitionIndexManager::allocate_indexes(const std::string&
     std::vector<SampleId> indexes;
     indexes.reserve(count);
 
-    // Reuse pool first (FIFO).
     std::size_t num_reuse = std::min(count, reusable_indexes_.size());
     if (num_reuse > 0) {
         indexes.insert(indexes.end(), reusable_indexes_.begin(), reusable_indexes_.begin() + num_reuse);
         reusable_indexes_.erase(reusable_indexes_.begin(), reusable_indexes_.begin() + num_reuse);
     }
 
-    // Mint new consecutive ids for the rest.
     while (indexes.size() < count) {
         indexes.push_back(next_index_++);
     }
@@ -59,11 +57,6 @@ void PartitionIndexManager::release_indexes(const std::string& partition_id,
         }
     }
 
-    // Dedupe before releasing into the reuse pool: a duplicate id in the
-    // caller's list must not be pushed in twice, or a later
-    // allocate_indexes() could hand the same global id out to two
-    // different callers. Order among the first occurrences is preserved,
-    // keeping the documented FIFO behavior intact for well-formed input.
     std::unordered_set<SampleId> seen;
     std::vector<SampleId> unique_release;
     unique_release.reserve(indexes_to_release.size());

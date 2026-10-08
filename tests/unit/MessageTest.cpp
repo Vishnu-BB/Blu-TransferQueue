@@ -362,5 +362,54 @@ int main() {
         CHECK(last_ts >= first_ts); // non-decreasing across a tight loop
     }
 
+    // ---- serialize_header()/deserialize_split(): the split wire form
+    // RpcClient.cpp/RpcServerBase.cpp use to avoid an extra full-payload
+    // copy (see docs/TransferQueue-Benchmark.md's Section 8/9). Confirms
+    // three things nothing above exercises: the header alone decodes to an
+    // EMPTY body.payload regardless of what the real payload was (it must
+    // never leak into the header), the header is actually smaller than the
+    // combined buffer when a real payload is present (otherwise there's no
+    // point to any of this), and reassembling via deserialize_split()
+    // produces a Message equivalent in every field to what the original
+    // single-buffer serialize()/deserialize() round trip gives. ----
+    {
+        MessageBody body = make_fully_populated_body();
+        CHECK(!body.payload.empty()); // fixture includes a real payload
+        auto msg = Message::create(RequestType::GET_META_RESPONSE, "sender-1", body, "receiver-1");
+
+        auto full_bytes = msg.serialize();
+        auto header_bytes = msg.serialize_header();
+        CHECK(header_bytes.size() < full_bytes.size());
+        CHECK(full_bytes.size() - header_bytes.size() == body.payload.size());
+
+        // Header alone, decoded via the ordinary deserialize(): payload
+        // must be empty, not the real (non-empty) payload leaking through.
+        auto header_only = Message::deserialize(header_bytes);
+        CHECK(header_only.body.payload.empty());
+        CHECK(header_only.request_type == RequestType::GET_META_RESPONSE);
+        CHECK(header_only.sender_id == "sender-1");
+
+        // Reassembled via deserialize_split(): equivalent to the original
+        // single-buffer round trip in every field, including the payload
+        // this time.
+        auto reassembled = Message::deserialize_split(header_bytes, body.payload);
+        CHECK(reassembled.request_type == msg.request_type);
+        CHECK(reassembled.sender_id == msg.sender_id);
+        CHECK(reassembled.receiver_id.has_value() && *reassembled.receiver_id == *msg.receiver_id);
+        CHECK(reassembled.request_id == msg.request_id);
+        CHECK(reassembled.timestamp == msg.timestamp);
+        check_body_equal(reassembled.body, body);
+
+        // An empty payload round-trips through the split form too (the
+        // common case -- most request types never carry one at all).
+        MessageBody empty_body;
+        empty_body.partition_id = "p";
+        auto empty_msg = Message::create(RequestType::HANDSHAKE, "s", empty_body);
+        auto empty_header = empty_msg.serialize_header();
+        auto empty_reassembled = Message::deserialize_split(empty_header, {});
+        CHECK(empty_reassembled.body.payload.empty());
+        CHECK(empty_reassembled.body.partition_id == "p");
+    }
+
     return tq::test::summary("MessageTest");
 }

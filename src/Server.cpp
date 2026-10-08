@@ -23,9 +23,6 @@ Message TransferQueueServer::handle_request(const Message& request) {
 
             controller_->create_partition(body.partition_id); // idempotent
 
-            // Throws before any write happens if a field conflicts with a
-            // declared schema -- fail fast, no partial writes. Mirrors
-            // Client::put()'s same check for the in-process path.
             std::unordered_map<std::string, FieldDtype> field_dtypes;
             for (const auto& [id, record] : data) {
                 (void)id;
@@ -44,9 +41,21 @@ Message TransferQueueServer::handle_request(const Message& request) {
             meta.fields = body.fields;
             storage_->put_data(meta, data);
 
-            // Only mark a field produced for a sample if that sample's own
-            // record actually contains it -- see Client::put()'s identical
-            // fix and docs/UNIT_TEST_FINDINGS.md.
+            // Group samples by the exact subset of body.fields their own
+            // record actually contains (not every sample need have every
+            // field -- see the "gap" regression test in ClientTest.cpp/
+            // ServerTest.cpp) so update_production_status is called once
+            // per group instead of once per sample. Typically one group for
+            // the whole batch, since real callers produce the same fields
+            // for every sample -- collapsing N Controller-lock acquisitions
+            // (and N DataPartitionStatus-lock acquisitions underneath) into
+            // one in that common case, same end state either way (see
+            // DataPartitionStatus::update_production_status: it just
+            // inserts every id into each field's produced-set, order- and
+            // batching-independent).
+            std::optional<std::string> group_id_opt =
+                body.group_id.empty() ? std::nullopt : std::optional<std::string>(body.group_id);
+            std::unordered_map<std::string, std::pair<std::vector<std::string>, std::vector<SampleId>>> groups;
             for (const auto& [id, record] : data) {
                 std::vector<std::string> produced_fields;
                 produced_fields.reserve(body.fields.size());
@@ -55,9 +64,18 @@ Message TransferQueueServer::handle_request(const Message& request) {
                         produced_fields.push_back(field);
                     }
                 }
-                std::optional<std::string> group_id_opt =
-                    body.group_id.empty() ? std::nullopt : std::optional<std::string>(body.group_id);
-                controller_->update_production_status(body.partition_id, {id}, produced_fields, std::nullopt,
+                std::string signature;
+                for (const auto& f : produced_fields) {
+                    signature += f;
+                    signature += '\x1f';
+                }
+                auto& group = groups[signature];
+                group.first = produced_fields;
+                group.second.push_back(id);
+            }
+            for (auto& [signature, group] : groups) {
+                (void)signature;
+                controller_->update_production_status(body.partition_id, group.second, group.first, std::nullopt,
                                                         group_id_opt);
             }
 
@@ -67,13 +85,6 @@ Message TransferQueueServer::handle_request(const Message& request) {
         }
 
         case RequestType::GET_META: {
-            // Atomic: select_and_consume() does ready-scan, sample, and
-            // mark-consumed under one Controller lock. The previous
-            // three-separate-calls version had a real race under this
-            // server's thread pool -- two concurrent GET_META requests
-            // could both read the same ready set before either marked
-            // anything consumed, and both receive the same sample(s). See
-            // docs/PHASE_7.md.
             auto selected =
                 controller_->select_and_consume(body.partition_id, body.fields, body.task_name, *sampler_,
                                                  body.batch_size);
@@ -110,12 +121,6 @@ Message TransferQueueServer::handle_request(const Message& request) {
         case RequestType::CLEAR_PARTITION: {
             auto cleared = controller_->clear_partition(body.partition_id, body.flag);
 
-            // Controller only clears its own metadata -- it has no
-            // StorageManager reference, so the actual bytes are only freed
-            // here, using the ids it just handed back. This is the
-            // colocated single-shard server, so shard_indices (Phase 5's
-            // multi-shard fan-out info) doesn't matter here -- every id
-            // goes to this one StorageManager regardless.
             if (!cleared.sample_ids.empty()) {
                 BatchMeta clear_meta;
                 clear_meta.sample_ids = cleared.sample_ids;
@@ -149,8 +154,6 @@ Message TransferQueueServer::handle_request(const Message& request) {
         }
 
         case RequestType::FIND_STRANDED_GROUPS: {
-            // Maintenance/observability only -- never consumes, clears, or
-            // mutates anything. See docs/GRPO_GROUP_N_SAMPLER.md.
             auto stranded = controller_->find_stranded_groups(body.partition_id, body.fields, body.task_name,
                                                                 *sampler_, body.max_age_ms);
 

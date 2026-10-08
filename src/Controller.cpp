@@ -20,9 +20,6 @@ bool TransferQueueController::ensure_partition_locked(const std::string& partiti
         return false;
     }
 
-    // Piecewise construction: DataPartitionStatus holds a std::mutex, so it's
-    // non-movable -- it must be built in place inside the map node, not
-    // constructed as a temporary and moved in.
     partitions_.emplace(std::piecewise_construct, std::forward_as_tuple(partition_id),
                          std::forward_as_tuple(partition_id));
 
@@ -56,7 +53,6 @@ void TransferQueueController::validate_schema(const std::string& partition_id,
     }
 }
 
-// Private, lock-free: every call site already holds mutex_.
 DataPartitionStatus* TransferQueueController::find_partition(const std::string& partition_id) {
     auto it = partitions_.find(partition_id);
     return it == partitions_.end() ? nullptr : &it->second;
@@ -173,20 +169,12 @@ std::vector<SampleId> TransferQueueController::select_and_consume(const std::str
     }
     auto ready = partition->scan_data_status(fields, task_name);
 
-    // Resolve each ready id's real group_id so group-aware samplers (e.g.
-    // GRPOGroupNSampler) can group by actual prompt identity instead of
-    // guessing from id adjacency -- see docs/GRPO_GROUP_N_SAMPLER.md.
     std::vector<std::string> group_ids;
     group_ids.reserve(ready.size());
     for (SampleId id : ready) {
         group_ids.push_back(partition->group_id_for_sample(id));
     }
 
-    // Moved, not copied: `ready` is a fresh vector nothing else references
-    // (scan_data_status never returns a reference to internal state), and
-    // this call runs under mutex_ -- avoiding the copy here matters since
-    // the lock is global across every partition, not just this one. See
-    // BaseSampler's by-value parameter note (Sampler.h) and docs/PHASE_7.md.
     auto [selected, remaining] = sampler.sample(std::move(ready), std::move(group_ids), batch_size);
     (void)remaining;
     if (!selected.empty()) {
@@ -216,8 +204,6 @@ std::vector<StrandedGroup> TransferQueueController::find_stranded_groups(const s
         produced_at_ms.push_back(partition->produced_at(id));
     }
 
-    // Read-only: unlike select_and_consume, nothing here is ever marked
-    // consumed or cleared -- this is purely a report.
     return sampler.find_stranded(ready, group_ids, produced_at_ms, now_ms(), max_age_ms);
 }
 
@@ -238,18 +224,8 @@ TransferQueueController::ClearedSamples TransferQueueController::clear_partition
     if (!partition) {
         return {};
     }
-    // The real set of sample ids this partition actually contains --
-    // PartitionIndexManager only ever tracks the pre-allocated placeholder
-    // it mints itself (see ensure_partition_locked); real sample ids are
-    // chosen by callers and never registered with it, so
-    // get_indexes_for_partition() can't answer "what does this partition
-    // contain" (confirmed: returned stale/wrong ids here before this fix,
-    // meaning clear_partition never actually cleared real data at all).
     auto owned_indexes = partition->all_sample_ids();
 
-    // Shard assignments must be read before clear_data() -- it erases
-    // sample_shard_ entries, so this is the last chance to know where each
-    // id actually lived (needed for Phase 5's multi-shard fan-out).
     ClearedSamples result;
     result.sample_ids = owned_indexes;
     result.shard_indices.reserve(owned_indexes.size());
@@ -258,7 +234,7 @@ TransferQueueController::ClearedSamples TransferQueueController::clear_partition
     }
 
     partition->clear_data(owned_indexes, clear_consumption);
-    index_manager_.release_partition(partition_id); // frees the pre-allocated placeholder for reuse
+    index_manager_.release_partition(partition_id);
     partitions_.erase(partition_id);
     return result;
 }

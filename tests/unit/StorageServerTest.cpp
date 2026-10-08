@@ -224,16 +224,26 @@ int main() {
         body.partition_id = "p";
         body.payload = {0x01, 0x02}; // too short to be a valid serialize_batch encoding
         auto bad_request = tq::Message::create(tq::RequestType::PUT_DATA, "bad-client", body);
-        auto bytes = bad_request.serialize();
-        dealer.send(zmq::buffer(bytes), zmq::send_flags::none);
+        // 2 frames (header, payload) -- matches TransferQueueRpcClient's
+        // real wire format (see RpcClient.cpp's call()).
+        auto header = bad_request.serialize_header();
+        dealer.send(zmq::buffer(header), zmq::send_flags::sndmore);
+        dealer.send(zmq::buffer(bad_request.body.payload), zmq::send_flags::none);
 
-        zmq::message_t reply;
-        auto result = dealer.recv(reply, zmq::recv_flags::none);
+        zmq::message_t reply_header;
+        auto result = dealer.recv(reply_header, zmq::recv_flags::none);
         CHECK(result.has_value()); // didn't hang
+        zmq::message_t reply_payload;
+        auto result2 = dealer.recv(reply_payload, zmq::recv_flags::none);
+        CHECK(result2.has_value());
 
-        std::vector<std::uint8_t> reply_bytes(static_cast<const std::uint8_t*>(reply.data()),
-                                               static_cast<const std::uint8_t*>(reply.data()) + reply.size());
-        auto decoded = tq::Message::deserialize(reply_bytes);
+        std::vector<std::uint8_t> header_bytes(static_cast<const std::uint8_t*>(reply_header.data()),
+                                                static_cast<const std::uint8_t*>(reply_header.data()) +
+                                                    reply_header.size());
+        std::vector<std::uint8_t> payload_bytes(static_cast<const std::uint8_t*>(reply_payload.data()),
+                                                 static_cast<const std::uint8_t*>(reply_payload.data()) +
+                                                     reply_payload.size());
+        auto decoded = tq::Message::deserialize_split(header_bytes, std::move(payload_bytes));
         CHECK(decoded.request_type == tq::RequestType::REQUEST_ERROR);
         CHECK(!decoded.body.success);
 

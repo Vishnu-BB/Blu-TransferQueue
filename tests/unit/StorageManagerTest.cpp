@@ -435,6 +435,32 @@ int main() {
         CHECK(f32_eq(decoded.at(3).at("reward"), {-1.25f}));
     }
     {
+        // ---- Multi-dimensional tensor and an invalid (default-constructed)
+        // tensor through serialize_batch/deserialize_batch. Both exercise
+        // code paths every other test in this block happens to skip:
+        // serialized_batch_size()'s rank*8 dims computation (every other
+        // tensor here is rank 1, where a rank-counting bug would be
+        // invisible) and OwnTensor::save_tensor's 4-byte "TNS0" short form
+        // for an invalid tensor (the pre-sized-buffer rewrite's size
+        // formula special-cases this -- see src/StorageManager.cpp). ----
+        Tensor rank2(Shape{{2, 3}}, Dtype::Float32);
+        auto* rank2_data = static_cast<float*>(rank2.data());
+        for (int i = 0; i < 6; ++i) rank2_data[i] = static_cast<float>(i);
+
+        tq::Record r;
+        r["grid"] = rank2;
+        r["missing"] = Tensor(); // invalid/default-constructed
+        auto bytes = tq::serialize_batch({{1, r}});
+        auto decoded = tq::deserialize_batch(bytes);
+        CHECK(decoded.size() == 1);
+        const auto& grid = decoded.at(1).at("grid");
+        CHECK(grid.ndim() == 2);
+        CHECK(grid.shape().dims[0] == 2 && grid.shape().dims[1] == 3);
+        auto* decoded_data = static_cast<const float*>(grid.data());
+        for (int i = 0; i < 6; ++i) CHECK(decoded_data[i] == static_cast<float>(i));
+        CHECK(!decoded.at(1).at("missing").is_valid());
+    }
+    {
         // Empty batch round-trips to an empty map, not a crash/throw.
         std::unordered_map<tq::SampleId, tq::Record> empty_data;
         auto bytes = tq::serialize_batch(empty_data);

@@ -30,22 +30,10 @@ std::pair<std::vector<SampleId>, std::vector<SampleId>> GRPOGroupNSampler::sampl
 
     std::size_t required_groups = batch_size / n_samples_per_prompt_;
 
-    // Sort by SampleId via an index permutation (not sorting ready_ids
-    // directly) so group_ids stays in sync without a second parallel sort
-    // or an extra copy -- this is the one O(M log M) pass; everything
-    // after it is O(M) or O(G log G) (G = distinct groups <= M). Running
-    // this under Controller's global lock (see docs/PHASE_7.md) is why
-    // avoiding redundant copies/sorts here actually matters.
     std::vector<std::size_t> order(ready_ids.size());
     std::iota(order.begin(), order.end(), std::size_t{0});
     std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return ready_ids[a] < ready_ids[b]; });
 
-    // Bucket by real group_id (std::map -> deterministic, sorted-by-key
-    // iteration order below). A sample with no recorded group_id ("") is
-    // simply never bucketed -- it can never be grouped, so it can never be
-    // selected; it always ends up in still_ready. sorted_ids is built in
-    // the same pass, sorted by SampleId, used both for the
-    // insufficient-groups return and for building still_ready.
     std::map<std::string, std::vector<SampleId>> buckets;
     std::vector<SampleId> sorted_ids;
     sorted_ids.reserve(ready_ids.size());
@@ -65,7 +53,7 @@ std::pair<std::vector<SampleId>, std::vector<SampleId>> GRPOGroupNSampler::sampl
             break;
         }
         if (ids.size() < n_samples_per_prompt_) {
-            continue; // incomplete group -- stays ready, never selected
+            continue; 
         }
         for (std::size_t k = 0; k < n_samples_per_prompt_; ++k) {
             selected.push_back(ids[k]);
@@ -78,11 +66,6 @@ std::pair<std::vector<SampleId>, std::vector<SampleId>> GRPOGroupNSampler::sampl
         return {{}, std::move(sorted_ids)};
     }
 
-    // selected is built in group-visit order (alphabetical by group_id),
-    // not numeric id order -- groups found later can have smaller ids than
-    // ones found earlier if their group_ids interleave. Sort it too so
-    // both returned vectors are consistently in SampleId order; cheap,
-    // since |selected| == batch_size, not M.
     std::sort(selected.begin(), selected.end());
 
     std::vector<SampleId> still_ready;
@@ -105,10 +88,6 @@ std::vector<StrandedGroup> GRPOGroupNSampler::find_stranded(const std::vector<Sa
             "GRPOGroupNSampler::find_stranded: ready_ids, group_ids, and produced_at_ms must be the same length");
     }
 
-    // Bucket every ready id by group_id, INCLUDING the "" (never recorded)
-    // bucket -- an ungrouped id can never complete a group by definition,
-    // so it's always worth surfacing if it's been sitting a while,
-    // regardless of how many other ungrouped ids happen to be around it.
     std::map<std::string, std::vector<std::pair<SampleId, std::int64_t>>> buckets;
     for (std::size_t i = 0; i < ready_ids.size(); ++i) {
         buckets[group_ids[i]].emplace_back(ready_ids[i], produced_at_ms[i]);
@@ -118,14 +97,9 @@ std::vector<StrandedGroup> GRPOGroupNSampler::find_stranded(const std::vector<Sa
     for (auto& [group_id, members] : buckets) {
         bool incomplete = group_id.empty() || members.size() < n_samples_per_prompt_;
         if (!incomplete) {
-            continue; // a complete, selectable group -- not stranded, just waiting its turn
+            continue; 
         }
 
-        // Oldest member = smallest (earliest) produced_at_ms. -1 entries
-        // (unknown timestamp -- shouldn't happen for a genuinely ready id,
-        // since Controller always stamps this, but handled defensively)
-        // are excluded from the search rather than treated as infinitely
-        // old.
         std::int64_t oldest_produced_at = -1;
         for (const auto& [id, produced_at] : members) {
             (void)id;
@@ -137,12 +111,12 @@ std::vector<StrandedGroup> GRPOGroupNSampler::find_stranded(const std::vector<Sa
             }
         }
         if (oldest_produced_at < 0) {
-            continue; // no known timestamp for anything in this bucket -- can't judge age
+            continue; 
         }
 
         std::int64_t age_ms = now_ms - oldest_produced_at;
         if (age_ms < max_age_ms) {
-            continue; // not old enough yet
+            continue; 
         }
 
         std::vector<SampleId> sample_ids;

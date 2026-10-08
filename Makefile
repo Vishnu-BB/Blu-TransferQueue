@@ -51,7 +51,7 @@ CUDA_LIB  := $(CUDA_HOME)lib64
 CORE_SRCS := src/BatchMeta.cpp src/Message.cpp src/PartitionIndexManager.cpp src/DataPartitionStatus.cpp \
              src/Controller.cpp src/Sampler.cpp src/GRPOGroupNSampler.cpp src/GroupRouter.cpp
 
-.PHONY: smoke test_tensor test_rpc test_correctness test_distributed test_distributed_n_to_m server_bin controller_server_bin storage_server_bin demo_pipeline unit_tests deps lib clean
+.PHONY: smoke test_tensor test_rpc test_correctness test_distributed test_distributed_n_to_m server_bin controller_server_bin storage_server_bin demo_pipeline benchmark control_plane_benchmark unit_tests deps lib clean
 
 smoke: $(BUILD_DIR)/test_scaffold_smoke
 	./$(BUILD_DIR)/test_scaffold_smoke
@@ -155,6 +155,31 @@ demo_pipeline: $(BUILD_DIR)/demo_pipeline
 $(BUILD_DIR)/demo_pipeline: $(DEMO_PIPELINE_SRCS)
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(TENSOR_INCLUDES) -DWITH_CUDA $(DEMO_PIPELINE_SRCS) $(TENSOR_LDFLAGS) $(TENSOR_LDLIBS) $(RPC_LDLIBS) -o $@
+
+# ---- Throughput benchmark harness: see docs/TransferQueue-Benchmark.md.
+#      Not a test -- times a PUT->GET cycle and reports Gbps/GB/s. Same
+#      deps as the demo pipeline (needs both Tensor-Implementations and ZMQ).
+BENCHMARK_SRCS := $(CORE_SRCS) $(TENSOR_SRCS) $(RPC_SRCS) tools/benchmark_main.cpp
+
+benchmark: $(BUILD_DIR)/benchmark
+	./$(BUILD_DIR)/benchmark
+
+$(BUILD_DIR)/benchmark: $(BENCHMARK_SRCS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(TENSOR_INCLUDES) -DWITH_CUDA $(BENCHMARK_SRCS) $(TENSOR_LDFLAGS) $(TENSOR_LDLIBS) $(RPC_LDLIBS) -o $@
+
+# ---- Control-plane microbenchmarks: see docs/TransferQueue-Benchmark.md.
+#      PartitionIndexManager/DataPartitionStatus/Controller/GRPOGroupNSampler
+#      -- none touch tensors or sockets, so this is core-tier only, same
+#      deps as `smoke`. Not a test -- prints CSV timing, no pass/fail.
+CONTROL_PLANE_BENCHMARK_SRCS := $(CORE_SRCS) tools/control_plane_benchmark_main.cpp
+
+control_plane_benchmark: $(BUILD_DIR)/control_plane_benchmark
+	./$(BUILD_DIR)/control_plane_benchmark
+
+$(BUILD_DIR)/control_plane_benchmark: $(CONTROL_PLANE_BENCHMARK_SRCS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(CONTROL_PLANE_BENCHMARK_SRCS) -pthread -o $@
 
 # ============================================================
 # Per-component unit tests (tests/unit/*Test.cpp) -- one file per component,

@@ -14,10 +14,8 @@ void TransferQueueClient::declare_schema(const std::string& partition_id,
 
 void TransferQueueClient::put(const std::string& partition_id, const std::vector<std::string>& fields,
                                const std::unordered_map<SampleId, Record>& data, const std::string& group_id) {
-    controller_->create_partition(partition_id); // idempotent: no-op if it already exists
+    controller_->create_partition(partition_id); 
 
-    // Throws before any write happens if a field conflicts with a declared
-    // schema -- fail fast, no partial writes.
     std::unordered_map<std::string, FieldDtype> field_dtypes;
     for (const auto& [id, record] : data) {
         (void)id;
@@ -36,12 +34,15 @@ void TransferQueueClient::put(const std::string& partition_id, const std::vector
     meta.fields = fields;
     storage_->put_data(meta, data);
 
-    // Only mark a field produced for a sample if that sample's own record
-    // actually contains it -- marking every field in `fields` regardless
-    // of what a given id's record actually held meant a sample missing a
-    // claimed field could be reported ready, and a consumer's .at() on the
-    // missing field would then throw downstream instead of failing here.
-    // See docs/UNIT_TEST_FINDINGS.md.
+    // Group samples by the exact subset of `fields` their own record
+    // actually contains (not every sample need have every field -- see the
+    // "gap" regression test below) so update_production_status is called
+    // once per group instead of once per sample. Typically one group for
+    // the whole batch -- collapsing N Controller-lock acquisitions into one
+    // in that common case; see Server.cpp's PUT_DATA handler for the same
+    // fix on the RPC path and why batching is behavior-preserving.
+    std::optional<std::string> group_id_opt = group_id.empty() ? std::nullopt : std::optional<std::string>(group_id);
+    std::unordered_map<std::string, std::pair<std::vector<std::string>, std::vector<SampleId>>> groups;
     for (const auto& [id, record] : data) {
         std::vector<std::string> produced_fields;
         produced_fields.reserve(fields.size());
@@ -50,8 +51,18 @@ void TransferQueueClient::put(const std::string& partition_id, const std::vector
                 produced_fields.push_back(field);
             }
         }
-        std::optional<std::string> group_id_opt = group_id.empty() ? std::nullopt : std::optional<std::string>(group_id);
-        controller_->update_production_status(partition_id, {id}, produced_fields, std::nullopt, group_id_opt);
+        std::string signature;
+        for (const auto& f : produced_fields) {
+            signature += f;
+            signature += '\x1f';
+        }
+        auto& group = groups[signature];
+        group.first = produced_fields;
+        group.second.push_back(id);
+    }
+    for (auto& [signature, group] : groups) {
+        (void)signature;
+        controller_->update_production_status(partition_id, group.second, group.first, std::nullopt, group_id_opt);
     }
 }
 
@@ -59,10 +70,7 @@ std::unordered_map<SampleId, Record> TransferQueueClient::get(const std::string&
                                                                 const std::vector<std::string>& fields,
                                                                 const std::string& task_name,
                                                                 std::size_t batch_size) {
-    // Atomic: see Controller::select_and_consume's doc comment -- matters
-    // if multiple threads ever share one Client instance concurrently
-    // against the same partition/task_name, not just the RPC servers'
-    // thread pool.
+
     auto selected = controller_->select_and_consume(partition_id, fields, task_name, *sampler_, batch_size);
 
     BatchMeta meta;

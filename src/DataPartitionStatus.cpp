@@ -10,7 +10,7 @@ std::int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
         .count();
 }
-} // namespace
+}
 
 void DataPartitionStatus::register_pre_allocated_indexes(const std::vector<SampleId>& indexes) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -34,7 +34,7 @@ void DataPartitionStatus::validate_field(const std::string& field, FieldDtype dt
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = declared_schema_.find(field);
     if (it == declared_schema_.end()) {
-        return; // never declared -- not validated, matches gradual-adoption design
+        return;
     }
     if (it->second != dtype) {
         throw std::invalid_argument("DataPartitionStatus::validate_field: field '" + field + "' in partition '" +
@@ -55,9 +55,6 @@ void DataPartitionStatus::update_production_status(const std::vector<SampleId>& 
         produced.insert(ids.begin(), ids.end());
     }
     global_indexes_.insert(ids.begin(), ids.end());
-    // First-write-wins: a sample's age should reflect when it first
-    // appeared, not when it was most recently touched by a later field
-    // update.
     std::int64_t now = now_ms();
     for (SampleId id : ids) {
         sample_produced_at_.emplace(id, now);
@@ -157,11 +154,6 @@ std::vector<SampleId> DataPartitionStatus::scan_data_status(const std::vector<st
         }
     }
 
-    // Only global_indexes_ needs scanning: update_production_status() always
-    // inserts into it alongside production_by_field_, so is_produced_locked()
-    // returning true already implies membership here. pre_allocated_indexes_
-    // entries that haven't been produced yet would fail is_produced_locked()
-    // anyway.
     std::vector<SampleId> ready;
     for (SampleId id : global_indexes_) {
         if (!has_consumed_locked(task_name, id) && is_produced_locked(id, fields)) {

@@ -16,10 +16,6 @@ Message ControllerServer::handle_request(const Message& request) {
 
     switch (request.request_type) {
         case RequestType::HANDSHAKE: {
-            // A plain client just checking connectivity leaves shard_index
-            // at its -1 default; a StorageServer announcing itself sets
-            // shard_index + address, which is the only thing that actually
-            // registers it.
             if (body.shard_index >= 0 && !body.address.empty()) {
                 controller_->register_shard(body.shard_index, body.address);
             }
@@ -40,12 +36,8 @@ Message ControllerServer::handle_request(const Message& request) {
         }
 
         case RequestType::NOTIFY_DATA_UPDATE: {
-            controller_->create_partition(body.partition_id); // idempotent
+            controller_->create_partition(body.partition_id);
 
-            // Validated only now, after the StorageServer has already
-            // durably written the data -- no two-phase-commit protocol to
-            // reject the write up front. A mismatch here is a loud signal
-            // to the writer (NOTIFY_DATA_UPDATE_ERROR), not a rollback.
             std::unordered_map<std::string, FieldDtype> field_dtypes;
             for (std::size_t i = 0; i < body.fields.size() && i < body.field_dtypes.size(); ++i) {
                 field_dtypes[body.fields[i]] = body.field_dtypes[i];
@@ -89,25 +81,10 @@ Message ControllerServer::handle_request(const Message& request) {
         }
 
         case RequestType::GET_META: {
-            // Atomic: select_and_consume() does ready-scan, sample, and
-            // mark-consumed under one Controller lock -- required once
-            // multiple independent readers (e.g. several trainer ranks in
-            // an N:M topology, see docs/PHASE_7.md) can issue concurrent
-            // GET_META requests against the same partition/task_name. The
-            // previous three-separate-calls version could let two
-            // concurrent requests both read the same ready set before
-            // either marked anything consumed, handing the same sample(s)
-            // to both.
             auto selected =
                 controller_->select_and_consume(body.partition_id, body.fields, body.task_name, *sampler_,
                                                  body.batch_size);
 
-            // No StorageManager here -- this bundles each selected sample's
-            // shard + every distinct shard's resolved address (per the
-            // decision to bundle rather than force a separate
-            // GET_SHARD_ADDRESS round trip), but the actual tensor data is
-            // a second hop: the caller uses this to send GET_DATA straight
-            // to each shard.
             MessageBody response_body;
             response_body.success = true;
             response_body.sample_ids = selected;
@@ -128,10 +105,6 @@ Message ControllerServer::handle_request(const Message& request) {
                 response_body.shard_registry_addresses.push_back(address);
             }
 
-            // Phase 6 (staleness/versioning): bundled the same way as the
-            // shard registry above -- each selected sample's produced-at
-            // version, plus the current version as of this read, so the
-            // caller can compute staleness without a separate round trip.
             response_body.sample_versions.reserve(selected.size());
             for (SampleId id : selected) {
                 response_body.sample_versions.push_back(controller_->version_for_sample(body.partition_id, id));
@@ -144,10 +117,6 @@ Message ControllerServer::handle_request(const Message& request) {
         case RequestType::CLEAR_PARTITION: {
             auto cleared = controller_->clear_partition(body.partition_id, body.flag);
 
-            // No local StorageManager to fall back on here (unlike the
-            // colocated TransferQueueServer) -- every id's bytes live on a
-            // remote StorageServer, so fan the clear out via a transient
-            // RpcClient per shard actually used.
             std::unordered_map<std::int32_t, std::vector<SampleId>> ids_by_shard;
             for (std::size_t i = 0; i < cleared.sample_ids.size(); ++i) {
                 std::int32_t shard = cleared.shard_indices[i];
@@ -155,16 +124,6 @@ Message ControllerServer::handle_request(const Message& request) {
                     ids_by_shard[shard].push_back(cleared.sample_ids[i]);
                 }
             }
-            // An unregistered/unreachable shard used to be silently skipped
-            // here -- no error, success=true regardless, and the caller had
-            // no way to know that shard's bytes were never actually freed
-            // (Controller has already dropped its own metadata for those
-            // ids by this point regardless, so there's no "undo"). Now
-            // every shard is still attempted -- one shard's failure
-            // (unresolved address, or the RPC itself throwing) no longer
-            // aborts the rest of the fan-out -- and every shard that
-            // couldn't be cleared is collected and surfaced to the caller.
-            // See docs/UNIT_TEST_FINDINGS.md.
             std::vector<std::int32_t> unreachable_shards;
             for (const auto& [shard, ids] : ids_by_shard) {
                 auto address = controller_->shard_address(shard);
@@ -207,8 +166,6 @@ Message ControllerServer::handle_request(const Message& request) {
         }
 
         case RequestType::FIND_STRANDED_GROUPS: {
-            // Maintenance/observability only -- never consumes, clears, or
-            // mutates anything. See docs/GRPO_GROUP_N_SAMPLER.md.
             auto stranded = controller_->find_stranded_groups(body.partition_id, body.fields, body.task_name,
                                                                 *sampler_, body.max_age_ms);
 

@@ -236,5 +236,48 @@ int main() {
         for (int t = 0; t < kThreads; ++t) CHECK(thread_ok[t] == 1);
     }
 
+    // ---- put() now groups samples by their exact produced-fields
+    // signature before calling Controller::update_production_status, to
+    // collapse N per-sample lock acquisitions into one call per group (see
+    // the comment at its call site). The old per-sample loop never had to
+    // get more than a single two-way split right (one sample missing one
+    // field, covered above) -- this specifically exercises THREE distinct
+    // signatures landing in the same put() call, to prove the new grouping
+    // logic itself (not just the already-covered single-gap case) assigns
+    // every sample to the right group and produces the exact same end state
+    // the old unbatched per-sample calls would have. ----
+    {
+        auto client = make_client();
+        tq::Record full;        // produces both "a" and "b"
+        full["a"] = make_f32(1.0f);
+        full["b"] = make_f32(2.0f);
+        tq::Record a_only;      // produces only "a"
+        a_only["a"] = make_f32(3.0f);
+        tq::Record b_only;      // produces only "b"
+        b_only["b"] = make_f32(4.0f);
+        tq::Record neither;     // produces neither requested field
+        neither["c"] = make_f32(5.0f);
+
+        client->put("mixed_groups", {"a", "b"},
+                    {{1, full}, {2, a_only}, {3, b_only}, {4, neither}});
+
+        auto ready_both = client->get("mixed_groups", {"a", "b"}, "trainer", 10);
+        CHECK(ready_both.size() == 1);
+        CHECK(ready_both.count(1) == 1); // only sample 1 produced BOTH fields
+
+        auto ready_a = client->get("mixed_groups", {"a"}, "trainer", 10);
+        CHECK(ready_a.size() == 1);
+        CHECK(ready_a.count(2) == 1); // sample 2 produced "a" (consumed above already excludes 1)
+
+        auto ready_b = client->get("mixed_groups", {"b"}, "trainer", 10);
+        CHECK(ready_b.size() == 1);
+        CHECK(ready_b.count(3) == 1); // sample 3 produced "b"
+
+        // Sample 4 (neither field) must never show up as ready for "a" or
+        // "b" no matter which field is queried.
+        auto ready_a_again = client->get("mixed_groups", {"a"}, "trainer", 10);
+        CHECK(ready_a_again.count(4) == 0);
+    }
+
     return tq::test::summary("ClientTest");
 }

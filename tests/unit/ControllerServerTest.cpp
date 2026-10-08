@@ -175,15 +175,25 @@ int main() {
             body.task_name = "raw-check";
             body.batch_size = 2;
             auto request = tq::Message::create(tq::RequestType::GET_META, "raw-client", body);
-            auto bytes = request.serialize();
-            dealer.send(zmq::buffer(bytes), zmq::send_flags::none);
+            // 2 frames (header, payload) -- matches TransferQueueRpcClient's
+            // real wire format (see RpcClient.cpp's call()).
+            auto header = request.serialize_header();
+            dealer.send(zmq::buffer(header), zmq::send_flags::sndmore);
+            dealer.send(zmq::buffer(request.body.payload), zmq::send_flags::none);
 
-            zmq::message_t reply;
-            auto result = dealer.recv(reply, zmq::recv_flags::none);
+            zmq::message_t reply_header;
+            auto result = dealer.recv(reply_header, zmq::recv_flags::none);
             CHECK(result.has_value());
-            std::vector<std::uint8_t> reply_bytes(static_cast<const std::uint8_t*>(reply.data()),
-                                                   static_cast<const std::uint8_t*>(reply.data()) + reply.size());
-            auto decoded = tq::Message::deserialize(reply_bytes);
+            zmq::message_t reply_payload;
+            auto result2 = dealer.recv(reply_payload, zmq::recv_flags::none);
+            CHECK(result2.has_value());
+            std::vector<std::uint8_t> header_bytes(static_cast<const std::uint8_t*>(reply_header.data()),
+                                                    static_cast<const std::uint8_t*>(reply_header.data()) +
+                                                        reply_header.size());
+            std::vector<std::uint8_t> payload_bytes(static_cast<const std::uint8_t*>(reply_payload.data()),
+                                                     static_cast<const std::uint8_t*>(reply_payload.data()) +
+                                                         reply_payload.size());
+            auto decoded = tq::Message::deserialize_split(header_bytes, std::move(payload_bytes));
             CHECK(decoded.request_type == tq::RequestType::GET_META_RESPONSE);
             CHECK(decoded.body.payload.empty());
         }

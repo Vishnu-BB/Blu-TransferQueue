@@ -47,18 +47,34 @@ tq::Message raw_roundtrip(const std::string& address, const tq::Message& request
     dealer.set(zmq::sockopt::rcvtimeo, timeout_ms);
     dealer.connect(address);
 
-    auto bytes = request.serialize();
-    dealer.send(zmq::buffer(bytes), zmq::send_flags::none);
+    // 2 frames (header, payload) -- matches TransferQueueRpcClient's real
+    // wire format (see RpcClient.cpp's call()), not the old single combined
+    // buffer. Sending request.body.payload as-is (even when a test has
+    // deliberately set it to garbage bytes) preserves every malformed-
+    // payload test's intent unchanged.
+    auto header = request.serialize_header();
+    dealer.send(zmq::buffer(header), zmq::send_flags::sndmore);
+    dealer.send(zmq::buffer(request.body.payload), zmq::send_flags::none);
 
-    zmq::message_t reply;
-    auto result = dealer.recv(reply, zmq::recv_flags::none);
+    zmq::message_t reply_header;
+    auto result = dealer.recv(reply_header, zmq::recv_flags::none);
     CHECK(result.has_value()); // must not hang/drop -- exactly one reply, always
     if (!result.has_value()) {
         return tq::Message{}; // caller's subsequent CHECKs will just fail informatively
     }
-    std::vector<std::uint8_t> reply_bytes(static_cast<const std::uint8_t*>(reply.data()),
-                                           static_cast<const std::uint8_t*>(reply.data()) + reply.size());
-    return tq::Message::deserialize(reply_bytes);
+    zmq::message_t reply_payload;
+    auto result2 = dealer.recv(reply_payload, zmq::recv_flags::none);
+    CHECK(result2.has_value());
+    if (!result2.has_value()) {
+        return tq::Message{};
+    }
+    std::vector<std::uint8_t> header_bytes(static_cast<const std::uint8_t*>(reply_header.data()),
+                                            static_cast<const std::uint8_t*>(reply_header.data()) +
+                                                reply_header.size());
+    std::vector<std::uint8_t> payload_bytes(static_cast<const std::uint8_t*>(reply_payload.data()),
+                                             static_cast<const std::uint8_t*>(reply_payload.data()) +
+                                                 reply_payload.size());
+    return tq::Message::deserialize_split(header_bytes, std::move(payload_bytes));
 }
 
 struct Harness {
@@ -326,8 +342,9 @@ int main() {
             body.sample_ids = {1};
             body.fields = {"reward"};
             auto request = tq::Message::create(tq::RequestType::PUT_DATA, "vanishing", body);
-            auto bytes = request.serialize();
-            dealer.send(zmq::buffer(bytes), zmq::send_flags::none);
+            auto header = request.serialize_header();
+            dealer.send(zmq::buffer(header), zmq::send_flags::sndmore);
+            dealer.send(zmq::buffer(request.body.payload), zmq::send_flags::none);
             // Socket and context destroyed here, with no recv() -- the
             // reply the server is about to send has nowhere to land.
         }
@@ -351,6 +368,28 @@ int main() {
         CHECK(got.size() == 2);
         CHECK(got.count(1) == 1);
         CHECK(got.count(2) == 1);
+    }
+
+    // ---- Regression for a fixed latency bug (see
+    // docs/TransferQueue-Benchmark.md's "Bottleneck 3"): the reactor loop
+    // used to enqueue a request to the worker pool, immediately find its
+    // results queue empty (the worker had just started), and loop back
+    // into a recv() that blocked for up to its full 20ms timeout -- so even
+    // a near-instant request paid up to +20ms of pure, avoidable latency on
+    // every round trip. Fixed via a self-pipe wake socket the worker pings
+    // on completion so the reactor's poll() returns immediately instead of
+    // waiting out the timeout. A single small HANDSHAKE round trip -- the
+    // cheapest possible request -- must now complete in low single-digit
+    // milliseconds, not ~20ms; a generous 15ms bound (not a tight
+    // nanosecond assertion, to stay robust under CI/scheduler jitter) is
+    // still more than an order of magnitude below what the bug would have
+    // produced. ----
+    {
+        Harness h;
+        auto start = std::chrono::steady_clock::now();
+        h.client.handshake();
+        double elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        CHECK(elapsed_ms < 15.0);
     }
 
     return tq::test::summary("ServerTest");

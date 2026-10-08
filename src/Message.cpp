@@ -41,9 +41,6 @@ std::string to_string(RequestType type) {
 
 namespace {
 
-// Minimal length-prefixed binary encoding. No external dependency (matches
-// upstream's intent -- a compact wire format -- without pulling in msgpack
-// for a protocol that, this phase, doesn't yet carry real tensor payloads).
 void write_u32(std::vector<std::uint8_t>& out, std::uint32_t v) {
     for (int i = 0; i < 4; ++i) {
         out.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
@@ -57,12 +54,6 @@ std::uint8_t read_u8(const std::uint8_t* data, std::size_t size, std::size_t& of
     return data[offset++];
 }
 
-// Bounds-checked: an out-of-range byte used to be silently cast into
-// RequestType anyway, constructing a Message with an undefined enum value
-// that only failed later (and only indirectly) if something happened to
-// call to_string() on it. Now it fails fast at the deserialize boundary
-// instead of drifting downstream as a half-valid Message. See
-// docs/UNIT_TEST_FINDINGS.md.
 RequestType read_request_type(const std::uint8_t* data, std::size_t size, std::size_t& offset) {
     std::uint8_t value = read_u8(data, size, offset);
     if (value > static_cast<std::uint8_t>(RequestType::FIND_STRANDED_GROUPS_RESPONSE)) {
@@ -83,8 +74,6 @@ std::uint32_t read_u32(const std::uint8_t* data, std::size_t size, std::size_t& 
     return v;
 }
 
-// Two's-complement bit pattern preserved through the uint32 round trip, so
-// -1 (our "no shard" sentinel) round-trips correctly.
 void write_i32(std::vector<std::uint8_t>& out, std::int32_t v) { write_u32(out, static_cast<std::uint32_t>(v)); }
 
 std::int32_t read_i32(const std::uint8_t* data, std::size_t size, std::size_t& offset) {
@@ -126,8 +115,6 @@ std::uint64_t read_u64(const std::uint8_t* data, std::size_t size, std::size_t& 
     return v;
 }
 
-// Two's-complement bit pattern preserved through the uint64 round trip, so
-// -1 (our "no version recorded" sentinel) round-trips correctly.
 void write_i64(std::vector<std::uint8_t>& out, std::int64_t v) { write_u64(out, static_cast<std::uint64_t>(v)); }
 
 std::int64_t read_i64(const std::uint8_t* data, std::size_t size, std::size_t& offset) {
@@ -166,10 +153,6 @@ std::string read_string(const std::uint8_t* data, std::size_t size, std::size_t&
     return s;
 }
 
-// SampleId is std::uint64_t (BatchMeta.h), so this is just write_u64/read_u64
-// applied per element -- reuses them instead of hand-rolling the identical
-// 8-byte loop again (was pure duplication, zero behavioral difference; see
-// docs/UNIT_TEST_FINDINGS.md).
 void write_sample_ids(std::vector<std::uint8_t>& out, const std::vector<SampleId>& ids) {
     write_u32(out, static_cast<std::uint32_t>(ids.size()));
     for (SampleId id : ids) {
@@ -211,9 +194,6 @@ void write_field_dtypes(std::vector<std::uint8_t>& out, const std::vector<FieldD
     }
 }
 
-// Bounds-checked: an out-of-range byte used to be silently cast into
-// FieldDtype anyway (undefined-enum-value territory), failing open rather
-// than failing fast at the deserialize boundary. See docs/UNIT_TEST_FINDINGS.md.
 FieldDtype read_field_dtype(const std::uint8_t* data, std::size_t size, std::size_t& offset) {
     std::uint8_t value = read_u8(data, size, offset);
     if (value > static_cast<std::uint8_t>(FieldDtype::Float4_e2m1_2x)) {
@@ -259,7 +239,7 @@ std::string make_request_id() {
     return id;
 }
 
-} // namespace
+}
 
 Message Message::create(RequestType type, const std::string& sender_id, MessageBody body,
                          std::optional<std::string> receiver_id) {
@@ -273,47 +253,71 @@ Message Message::create(RequestType type, const std::string& sender_id, MessageB
     return msg;
 }
 
-std::vector<std::uint8_t> Message::serialize() const {
+namespace {
+
+// Shared by serialize() and serialize_header() -- identical encoding except
+// for the one write_bytes(out, ...) call for body.payload, which
+// serialize_header() always passes an empty vector to (so the header stays
+// small regardless of how big the real payload is). See Message.h's doc
+// comment on serialize_header()/deserialize_split() for why this split
+// exists.
+std::vector<std::uint8_t> serialize_impl(const Message& msg, const std::vector<std::uint8_t>& payload_to_embed) {
     std::vector<std::uint8_t> out;
-    out.push_back(static_cast<std::uint8_t>(request_type));
-    write_string(out, sender_id);
-    out.push_back(receiver_id.has_value() ? 1 : 0);
-    if (receiver_id.has_value()) {
-        write_string(out, *receiver_id);
+    out.push_back(static_cast<std::uint8_t>(msg.request_type));
+    write_string(out, msg.sender_id);
+    out.push_back(msg.receiver_id.has_value() ? 1 : 0);
+    if (msg.receiver_id.has_value()) {
+        write_string(out, *msg.receiver_id);
     }
-    write_string(out, request_id);
+    write_string(out, msg.request_id);
 
     static_assert(sizeof(double) == 8, "Message::serialize assumes 8-byte double");
     std::uint64_t ts_bits;
-    std::memcpy(&ts_bits, &timestamp, sizeof(ts_bits));
+    std::memcpy(&ts_bits, &msg.timestamp, sizeof(ts_bits));
     for (int i = 0; i < 8; ++i) {
         out.push_back(static_cast<std::uint8_t>(ts_bits >> (8 * i)));
     }
 
-    write_string(out, body.partition_id);
-    write_sample_ids(out, body.sample_ids);
-    write_string_list(out, body.fields);
-    write_field_dtypes(out, body.field_dtypes);
-    write_string(out, body.task_name);
-    write_u32(out, body.batch_size);
-    out.push_back(body.flag ? 1 : 0);
-    out.push_back(body.success ? 1 : 0);
-    write_string(out, body.error_message);
-    write_bytes(out, body.payload);
-    write_i32(out, body.shard_index);
-    write_string(out, body.address);
-    write_i32_list(out, body.sample_shard_indices);
-    write_i32_list(out, body.shard_registry_indices);
-    write_string_list(out, body.shard_registry_addresses);
-    write_i64_list(out, body.sample_versions);
-    write_i64(out, body.current_version);
-    write_string(out, body.group_id);
-    write_i64(out, body.max_age_ms);
-    write_string_list(out, body.stranded_group_ids);
-    write_i32_list(out, body.stranded_group_sizes);
-    write_i64_list(out, body.stranded_group_ages_ms);
+    write_string(out, msg.body.partition_id);
+    write_sample_ids(out, msg.body.sample_ids);
+    write_string_list(out, msg.body.fields);
+    write_field_dtypes(out, msg.body.field_dtypes);
+    write_string(out, msg.body.task_name);
+    write_u32(out, msg.body.batch_size);
+    out.push_back(msg.body.flag ? 1 : 0);
+    out.push_back(msg.body.success ? 1 : 0);
+    write_string(out, msg.body.error_message);
+    write_bytes(out, payload_to_embed);
+    write_i32(out, msg.body.shard_index);
+    write_string(out, msg.body.address);
+    write_i32_list(out, msg.body.sample_shard_indices);
+    write_i32_list(out, msg.body.shard_registry_indices);
+    write_string_list(out, msg.body.shard_registry_addresses);
+    write_i64_list(out, msg.body.sample_versions);
+    write_i64(out, msg.body.current_version);
+    write_string(out, msg.body.group_id);
+    write_i64(out, msg.body.max_age_ms);
+    write_string_list(out, msg.body.stranded_group_ids);
+    write_i32_list(out, msg.body.stranded_group_sizes);
+    write_i64_list(out, msg.body.stranded_group_ages_ms);
 
     return out;
+}
+
+} // namespace
+
+std::vector<std::uint8_t> Message::serialize() const { return serialize_impl(*this, body.payload); }
+
+std::vector<std::uint8_t> Message::serialize_header() const {
+    static const std::vector<std::uint8_t> kNoPayload;
+    return serialize_impl(*this, kNoPayload);
+}
+
+Message Message::deserialize_split(const std::vector<std::uint8_t>& header_bytes,
+                                    std::vector<std::uint8_t> payload_bytes) {
+    Message msg = deserialize(header_bytes);
+    msg.body.payload = std::move(payload_bytes);
+    return msg;
 }
 
 Message Message::deserialize(const std::vector<std::uint8_t>& bytes) {

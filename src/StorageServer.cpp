@@ -22,10 +22,6 @@ Message StorageServer::handle_request(const Message& request) {
                 (void)record;
                 meta.sample_ids.push_back(id);
             }
-            // Every id in one PUT_DATA call shares the same partition_id --
-            // assign(), not a per-iteration push_back, matching this
-            // handler's own GET_DATA/CLEAR_DATA siblings below (was a
-            // trivial inconsistency; see docs/UNIT_TEST_FINDINGS.md).
             meta.partition_ids.assign(meta.sample_ids.size(), body.partition_id);
             meta.fields = body.fields;
             storage_->put_data(meta, data);
