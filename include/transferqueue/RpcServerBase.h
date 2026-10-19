@@ -18,6 +18,10 @@ public:
     std::string start(const std::string& address);
     void stop();
 
+    // Per request type handled so far: "requests:<TYPE>" (int64 count) and
+    // "request_seconds:<TYPE>" (double, total handler time). For metrics.
+    Tag request_stats() const;
+
 protected:
     const std::string& server_id() const { return server_id_; }
 

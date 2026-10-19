@@ -1,6 +1,5 @@
 build/
 lib/
-.venv-ray/
 
 # Files
 *.md

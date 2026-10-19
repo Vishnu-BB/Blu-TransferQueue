@@ -11,6 +11,16 @@
 
 namespace tq {
 
+// One KV sample's controller-side state, as saved in a checkpoint.
+struct KVSampleSnapshot {
+    std::string key;
+    SampleId id = kMissingSample;
+    Tag tag;
+    std::int32_t shard = -1;
+    std::int64_t version = -1;
+    std::vector<std::string> fields;  // produced fields
+};
+
 class DataPartitionStatus {
 public:
     explicit DataPartitionStatus(std::string partition_id) : partition_id_(std::move(partition_id)) {}
@@ -46,6 +56,17 @@ public:
 
     std::vector<SampleId> all_sample_ids() const;
 
+    // ---- KV layer: string key <-> SampleId, plus one merged Tag per key ----
+    // kMissingSample for keys that were never bound.
+    std::vector<SampleId> ids_for_keys(const std::vector<std::string>& keys) const;
+    void bind_key(const std::string& key, SampleId id);
+    // Merges each tag into its key's existing tag (later values win per name),
+    // matching verl's kv_put(tag=...) status updates that keep is_prompt/global_steps.
+    void merge_tags(const std::vector<SampleId>& ids, const std::vector<Tag>& tags);
+    std::vector<std::pair<std::string, Tag>> list_keys() const;
+    std::size_t key_count() const;
+    std::vector<KVSampleSnapshot> kv_snapshot() const;
+
 private:
     // Lock-free: callers already hold mutex_.
     bool is_produced_locked(SampleId id, const std::vector<std::string>& fields) const;
@@ -61,6 +82,9 @@ private:
     std::unordered_map<SampleId, std::int64_t> sample_version_;
     std::unordered_map<SampleId, std::string> sample_group_id_;
     std::unordered_map<SampleId, std::int64_t> sample_produced_at_;
+    std::unordered_map<std::string, SampleId> key_to_id_;
+    std::unordered_map<SampleId, std::string> id_to_key_;
+    std::unordered_map<SampleId, Tag> sample_tag_;
 
     mutable std::mutex mutex_;
 };

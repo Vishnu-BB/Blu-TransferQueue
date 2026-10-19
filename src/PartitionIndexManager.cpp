@@ -85,4 +85,16 @@ std::vector<SampleId> PartitionIndexManager::get_indexes_for_partition(const std
     return std::vector<SampleId>(it->second.begin(), it->second.end());
 }
 
+void PartitionIndexManager::adopt_indexes(const std::string& partition_id, const std::vector<SampleId>& indexes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::unordered_set<SampleId> adopted(indexes.begin(), indexes.end());
+    reusable_indexes_.erase(std::remove_if(reusable_indexes_.begin(), reusable_indexes_.end(),
+                                           [&](SampleId id) { return adopted.count(id) != 0; }),
+                            reusable_indexes_.end());
+    for (SampleId id : indexes) {
+        next_index_ = std::max(next_index_, id + 1);
+    }
+    partition_to_indexes_[partition_id].insert(indexes.begin(), indexes.end());
+}
+
 }

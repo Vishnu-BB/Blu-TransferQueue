@@ -21,6 +21,10 @@ public:
 
     std::vector<SampleId> get_indexes_for_partition(const std::string& partition_id) const;
 
+    // Checkpoint restore: marks exact, previously-allocated ids as owned by
+    // partition_id, so later allocations never hand them out again.
+    void adopt_indexes(const std::string& partition_id, const std::vector<SampleId>& indexes);
+
 private:
     std::unordered_map<std::string, std::unordered_set<SampleId>> partition_to_indexes_;
     std::deque<SampleId> reusable_indexes_;

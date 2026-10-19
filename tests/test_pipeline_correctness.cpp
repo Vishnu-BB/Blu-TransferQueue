@@ -505,26 +505,18 @@ void test_storage_capacity_backpressure() {
     r2["reward"] = make_f32_tensor(std::vector<float>(8, 2.0f));
     client.put(partition, {"reward"}, {{2, r2}});
 
-    std::atomic<bool> blocked_write_finished{false};
-    std::thread background_writer([&]() {
-        tq::TransferQueueRpcClient writer_th("writer-bg", address);
-        Record r3;
-        // 10 floats = 40 bytes. 72 + 40 = 112 bytes > 80 capacity -> MUST BLOCK
-        r3["reward"] = make_f32_tensor(std::vector<float>(10, 3.0f));
-        writer_th.put(partition, {"reward"}, {{3, r3}});
-        blocked_write_finished = true;
-    });
+    // 72 + 40 = 112 bytes > 80: the server refuses instead of parking one of
+    // its worker threads until space frees up (a blocked pool can't run the
+    // CLEAR that would free it).
+    Record r3;
+    r3["reward"] = make_f32_tensor(std::vector<float>(10, 3.0f));
+    tq::TransferQueueRpcClient writer("writer-bp", address);
+    CHECK_THROWS(writer.put(partition, {"reward"}, {{3, r3}}), std::runtime_error);
 
-    // Wait 100ms and verify background writer is indeed blocked
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    CHECK(!blocked_write_finished.load());
-
-    // Free space by clearing sample 1 (frees 40 bytes)
+    // The server is still responsive, and the write fits once space is freed.
     client.clear_data(partition, {1});
-
-    // Background writer must unblock!
-    background_writer.join();
-    CHECK(blocked_write_finished.load());
+    CHECK_NOTHROW(writer.put(partition, {"reward"}, {{3, r3}}));
+    CHECK(storage->current_bytes() == 72);
 
     server.stop();
 }

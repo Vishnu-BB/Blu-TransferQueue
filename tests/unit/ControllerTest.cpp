@@ -366,5 +366,67 @@ int main() {
         CHECK(controller.ready_indexes("p1", {"reward"}, "trainer").empty());
     }
 
+    // ---- KV layer: key binding, tag merge, list, clear ----
+    {
+        tq::TransferQueueController controller;
+
+        // create=false on an unknown partition/key: all missing, nothing created.
+        auto none = controller.kv_retrieve("train", {"a"}, /*create=*/false);
+        CHECK(none.size() == 1 && none[0] == tq::kMissingSample);
+        CHECK(controller.kv_list("train").empty());
+
+        // create=true: fresh, distinct ids; the same key twice in one call shares an id.
+        auto ids = controller.kv_retrieve("train", {"a", "b", "a"}, /*create=*/true);
+        CHECK(ids.size() == 3);
+        CHECK(ids[0] == ids[2]);
+        CHECK(ids[0] != ids[1]);
+        CHECK(ids[0] != tq::kMissingSample && ids[1] != tq::kMissingSample);
+
+        // Stable: a second lookup returns the same ids, with or without create.
+        CHECK(controller.kv_retrieve("train", {"b", "a"}, false) == (std::vector<tq::SampleId>{ids[1], ids[0]}));
+        CHECK(controller.kv_retrieve("train", {"a"}, true)[0] == ids[0]);
+
+        // Keys are per-partition: "a" in "val" is a different sample.
+        auto val_ids = controller.kv_retrieve("val", {"a"}, true);
+        CHECK(val_ids[0] != ids[0]);
+
+        // Tags merge per name (verl's status updates keep is_prompt/global_steps).
+        controller.kv_merge_tags("train", {ids[0]},
+                                 {{{"is_prompt", true}, {"status", std::string("pending")},
+                                   {"global_steps", std::int64_t{3}}}});
+        controller.kv_merge_tags("train", {ids[0]}, {{{"status", std::string("running")}}});
+        auto listed = controller.kv_list("train");
+        CHECK(listed.size() == 2);
+        tq::Tag tag_a;
+        for (const auto& [key, tag] : listed) {
+            if (key == "a") tag_a = tag;
+        }
+        CHECK(std::get<std::string>(tag_a.at("status")) == "running");
+        CHECK(std::get<bool>(tag_a.at("is_prompt")));
+        CHECK(std::get<std::int64_t>(tag_a.at("global_steps")) == 3);
+        CHECK_THROWS(controller.kv_merge_tags("nope", {ids[0]}, {{}}), std::invalid_argument);
+        CHECK_THROWS(controller.kv_merge_tags("train", {ids[0]}, {}), std::invalid_argument);
+
+        // A produced field + shard on a KV sample is visible to the regular status path.
+        controller.update_production_status("train", {ids[0]}, {"responses"}, /*shard_index=*/1);
+        CHECK(controller.shard_for_sample("train", ids[0]) == 1);
+        CHECK(contains(controller.ready_indexes("train", {"responses"}, "t"), ids[0]));
+
+        // kv_clear: returns ids + shards, drops key/tag/production, ignores unknown keys.
+        auto cleared = controller.kv_clear("train", {"a", "zzz", "a"});
+        CHECK(cleared.sample_ids.size() == 2 && cleared.sample_ids[0] == ids[0]);
+        CHECK(cleared.shard_indices[0] == 1);
+        CHECK(controller.kv_retrieve("train", {"a"}, false)[0] == tq::kMissingSample);
+        CHECK(controller.kv_list("train").size() == 1);
+        CHECK(controller.ready_indexes("train", {"responses"}, "t").empty());
+
+        // A cleared key comes back as a brand-new, tag-less row.
+        auto again = controller.kv_retrieve("train", {"a"}, true);
+        CHECK(again[0] != tq::kMissingSample);
+        for (const auto& [key, tag] : controller.kv_list("train")) {
+            if (key == "a") CHECK(tag.empty());
+        }
+    }
+
     return tq::test::summary("ControllerTest");
 }

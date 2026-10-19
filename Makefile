@@ -2,8 +2,8 @@
 # Blu-TransferQueue Makefile
 # ============================================================
 # C++ port of https://github.com/Ascend/TransferQueue, nested inside
-# BluTrain as its own submodule (separate history/ownership). ../dist and
-# ../Tensor-Implementations are BluTrain siblings on disk -- no third_party
+# BluTrain/RL as its own submodule (separate history/ownership). ../../dist and
+# ../../Tensor-Implementations are BluTrain dirs on disk -- no third_party
 # checkout, no submodule-of-submodule.
 #
 # Five build lanes, by dependency weight:
@@ -28,7 +28,7 @@
 #   make clean
 # ============================================================
 
-BLUTRAIN_DIR     := ..
+BLUTRAIN_DIR     := ../..
 DIST_DIR         := $(BLUTRAIN_DIR)/dist
 TENSOR_IMPL_DIR  := $(BLUTRAIN_DIR)/Tensor-Implementations
 PROFILER_DIR     := $(BLUTRAIN_DIR)/Profiler
@@ -83,7 +83,8 @@ $(BUILD_DIR)/test_tensor_smoke: $(TENSOR_TEST_SRCS)
 # ---- Lane 3 (test_rpc): Server (ROUTER) + RpcClient (DEALER) over real
 #      cppzmq sockets, on top of Lane 2's Tensor-Implementations deps. No
 #      MPI/NCCL/dist. ----
-RPC_SRCS      := src/RpcServerBase.cpp src/Server.cpp src/RpcClient.cpp src/ControllerServer.cpp src/StorageServer.cpp
+RPC_SRCS      := src/RpcServerBase.cpp src/Server.cpp src/RpcClient.cpp src/ControllerServer.cpp src/StorageServer.cpp \
+                 src/KVClient.cpp src/MetricsHttpServer.cpp
 RPC_TEST_SRCS := $(CORE_SRCS) $(TENSOR_SRCS) $(RPC_SRCS) tests/test_rpc_smoke.cpp
 RPC_LDLIBS    := -lzmq -pthread
 
@@ -208,7 +209,7 @@ $(BUILD_DIR)/unit_rpc_%: tests/unit/%.cpp $(CORE_SRCS) $(TENSOR_SRCS) $(RPC_SRCS
 UNIT_CORE_TESTS   := BatchMetaTest PartitionIndexManagerTest DataPartitionStatusTest ControllerTest \
                      MessageTest FifoSamplerTest GRPOGroupNSamplerTest GroupRouterTest
 UNIT_TENSOR_TESTS := StorageManagerTest ClientTest
-UNIT_RPC_TESTS    := ServerTest RpcClientTest ControllerServerTest StorageServerTest
+UNIT_RPC_TESTS    := ServerTest RpcClientTest ControllerServerTest StorageServerTest KVClientTest
 
 UNIT_TEST_BINS := $(addprefix $(BUILD_DIR)/unit_core_,$(UNIT_CORE_TESTS)) \
                   $(addprefix $(BUILD_DIR)/unit_tensor_,$(UNIT_TENSOR_TESTS)) \

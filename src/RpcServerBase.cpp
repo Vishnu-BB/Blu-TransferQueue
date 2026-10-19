@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <utility>
 
@@ -49,6 +50,9 @@ struct RpcServerBase::Impl {
 
     std::mutex results_mutex;
     std::deque<PendingReply> results;
+
+    mutable std::mutex stats_mutex;
+    std::map<RequestType, std::pair<std::int64_t, double>> stats;  // count, seconds
 
     // Self-pipe trick: a worker thread that just finished pushes one byte
     // here so the reactor's poll() below returns immediately instead of
@@ -118,7 +122,14 @@ std::string RpcServerBase::start(const std::string& address) {
                         Message response;
                         try {
                             Message request = Message::deserialize_split(header_bytes, std::move(payload_bytes));
+                            const auto t0 = std::chrono::steady_clock::now();
                             response = handle_request(request);
+                            const double seconds =
+                                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                            std::lock_guard<std::mutex> stats_lock(impl_->stats_mutex);
+                            auto& [count, total] = impl_->stats[request.request_type];
+                            ++count;
+                            total += seconds;
                         } catch (const std::exception& e) {
                             MessageBody error_body;
                             error_body.success = false;
@@ -164,6 +175,16 @@ std::string RpcServerBase::start(const std::string& address) {
     });
 
     return bound_address;
+}
+
+Tag RpcServerBase::request_stats() const {
+    std::lock_guard<std::mutex> lock(impl_->stats_mutex);
+    Tag out;
+    for (const auto& [type, entry] : impl_->stats) {
+        out["requests:" + to_string(type)] = entry.first;
+        out["request_seconds:" + to_string(type)] = entry.second;
+    }
+    return out;
 }
 
 void RpcServerBase::stop() {

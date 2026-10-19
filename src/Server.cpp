@@ -39,7 +39,13 @@ Message TransferQueueServer::handle_request(const Message& request) {
                 meta.partition_ids.push_back(body.partition_id);
             }
             meta.fields = body.fields;
-            storage_->put_data(meta, data);
+            if (!storage_->try_put_data(meta, data)) {
+                MessageBody response_body;
+                response_body.success = false;
+                response_body.error_message = "storage full: not enough free capacity for this batch -- clear "
+                                              "consumed samples and retry";
+                return Message::create(RequestType::PUT_DATA_RESPONSE, server_id(), response_body, request.sender_id);
+            }
 
             // Group samples by the exact subset of body.fields their own
             // record actually contains (not every sample need have every
@@ -108,6 +114,11 @@ Message TransferQueueServer::handle_request(const Message& request) {
         }
 
         case RequestType::CLEAR_DATA: {
+            // Metadata first: once the data is gone, no reader may still see
+            // these samples as produced (it would get empty records back and
+            // mark them consumed).
+            controller_->clear_samples(body.partition_id, body.sample_ids);
+
             BatchMeta meta;
             meta.sample_ids = body.sample_ids;
             meta.partition_ids.assign(body.sample_ids.size(), body.partition_id);

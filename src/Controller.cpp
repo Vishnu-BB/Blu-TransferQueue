@@ -1,7 +1,16 @@
 #include "transferqueue/Controller.h"
 
+#include "transferqueue/Message.h"
+
+#include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <stdexcept>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 
 namespace {
@@ -137,6 +146,11 @@ std::optional<std::string> TransferQueueController::shard_address(std::int32_t s
     return it->second;
 }
 
+std::unordered_map<std::int32_t, std::string> TransferQueueController::shard_registry() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return shard_registry_;
+}
+
 void TransferQueueController::mark_consumed(const std::string& partition_id, const std::string& task_name,
                                              const std::vector<SampleId>& ids) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -237,6 +251,251 @@ TransferQueueController::ClearedSamples TransferQueueController::clear_partition
     index_manager_.release_partition(partition_id);
     partitions_.erase(partition_id);
     return result;
+}
+
+void TransferQueueController::clear_samples(const std::string& partition_id, const std::vector<SampleId>& ids) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto* partition = find_partition(partition_id);
+    if (partition) {
+        partition->clear_data(ids, /*clear_consumption=*/true);
+    }
+}
+
+std::vector<SampleId> TransferQueueController::kv_retrieve(const std::string& partition_id,
+                                                          const std::vector<std::string>& keys, bool create) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (create) {
+        ensure_partition_locked(partition_id);
+    }
+    auto* partition = find_partition(partition_id);
+    if (!partition) {
+        return std::vector<SampleId>(keys.size(), kMissingSample);
+    }
+    auto ids = partition->ids_for_keys(keys);
+    if (!create) {
+        return ids;
+    }
+
+    std::unordered_set<std::string> new_keys;
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (ids[i] == kMissingSample) {
+            new_keys.insert(keys[i]);
+        }
+    }
+    std::size_t missing = new_keys.size();
+    if (missing == 0) {
+        return ids;
+    }
+    if (max_kv_samples_ > 0) {
+        std::size_t live = kv_sample_count_locked();
+        if (live + missing > max_kv_samples_) {
+            throw std::runtime_error("TransferQueue full: " + std::to_string(live) + " samples held, " +
+                                     std::to_string(missing) + " new key(s) would exceed total_storage_size=" +
+                                     std::to_string(max_kv_samples_) + " -- clear consumed groups first");
+        }
+    }
+    auto fresh = index_manager_.allocate_indexes(partition_id, missing);
+    std::size_t next = 0;
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (ids[i] != kMissingSample) {
+            continue;
+        }
+        // The same new key twice in one call must map to one id.
+        auto dup = partition->ids_for_keys({keys[i]})[0];
+        if (dup != kMissingSample) {
+            ids[i] = dup;
+            continue;
+        }
+        ids[i] = fresh[next++];
+        partition->bind_key(keys[i], ids[i]);
+    }
+    if (next < fresh.size()) {
+        index_manager_.release_indexes(partition_id, std::vector<SampleId>(fresh.begin() + next, fresh.end()));
+    }
+    return ids;
+}
+
+std::size_t TransferQueueController::kv_sample_count_locked() const {
+    std::size_t total = 0;
+    for (const auto& [id, partition] : partitions_) {
+        (void)id;
+        total += partition.key_count();
+    }
+    return total;
+}
+
+std::vector<std::pair<std::string, std::size_t>> TransferQueueController::kv_partition_counts() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::pair<std::string, std::size_t>> out;
+    for (const auto& [id, partition] : partitions_) {
+        out.emplace_back(id, partition.key_count());
+    }
+    return out;
+}
+
+std::size_t TransferQueueController::kv_sample_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return kv_sample_count_locked();
+}
+
+void TransferQueueController::kv_merge_tags(const std::string& partition_id, const std::vector<SampleId>& ids,
+                                            const std::vector<Tag>& tags) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto* partition = find_partition(partition_id);
+    if (!partition) {
+        throw std::invalid_argument("kv_merge_tags: unknown partition '" + partition_id + "'");
+    }
+    partition->merge_tags(ids, tags);
+}
+
+std::vector<std::pair<std::string, Tag>> TransferQueueController::kv_list(const std::string& partition_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto* partition = find_partition(partition_id);
+    return partition ? partition->list_keys() : std::vector<std::pair<std::string, Tag>>{};
+}
+
+TransferQueueController::ClearedSamples TransferQueueController::kv_clear(const std::string& partition_id,
+                                                                          const std::vector<std::string>& keys) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto* partition = find_partition(partition_id);
+    if (!partition) {
+        return {};
+    }
+    ClearedSamples result;
+    for (SampleId id : partition->ids_for_keys(keys)) {
+        if (id == kMissingSample) {
+            continue;
+        }
+        result.sample_ids.push_back(id);
+        result.shard_indices.push_back(partition->shard_for_sample(id));
+    }
+    if (result.sample_ids.empty()) {
+        return result;
+    }
+    // ids_for_keys can repeat an id if a key is listed twice; release each once.
+    std::vector<SampleId> unique_ids = result.sample_ids;
+    std::sort(unique_ids.begin(), unique_ids.end());
+    unique_ids.erase(std::unique(unique_ids.begin(), unique_ids.end()), unique_ids.end());
+    partition->clear_data(unique_ids, /*clear_consumption=*/true);
+    index_manager_.release_indexes(partition_id, unique_ids);
+    return result;
+}
+
+namespace {
+constexpr char kCheckpointMagic[4] = {'T', 'Q', 'C', 'K'};
+constexpr std::uint32_t kCheckpointFormat = 1;
+
+template <typename T>
+void write_pod(std::ostream& os, const T& v) {
+    os.write(reinterpret_cast<const char*>(&v), sizeof(v));
+}
+template <typename T>
+T read_pod(std::istream& is) {
+    T v{};
+    is.read(reinterpret_cast<char*>(&v), sizeof(v));
+    if (!is) throw std::runtime_error("load_kv_checkpoint: truncated checkpoint file");
+    return v;
+}
+} // namespace
+
+void TransferQueueController::save_kv_checkpoint(const std::string& path) const {
+    // One record per (partition, produced-field set): prompt rows and
+    // trajectory rows each collapse into a handful of records.
+    std::vector<std::vector<std::uint8_t>> records;
+    std::int64_t version = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        version = current_version_;
+        for (const auto& [partition_id, partition] : partitions_) {
+            std::map<std::vector<std::string>, MessageBody> groups;
+            for (auto& snap : partition.kv_snapshot()) {
+                auto& body = groups[snap.fields];
+                body.partition_id = partition_id;
+                body.fields = snap.fields;
+                body.keys.push_back(std::move(snap.key));
+                body.sample_ids.push_back(snap.id);
+                body.tags.push_back(std::move(snap.tag));
+                body.sample_shard_indices.push_back(snap.shard);
+                body.sample_versions.push_back(snap.version);
+            }
+            for (auto& [fields, body] : groups) {
+                (void)fields;
+                records.push_back(Message::create(RequestType::KV_UPDATE, "checkpoint", std::move(body)).serialize());
+            }
+        }
+    }
+
+    // Write-then-rename so a crash mid-save never leaves a torn checkpoint.
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream os(tmp, std::ios::binary | std::ios::trunc);
+        if (!os) throw std::runtime_error("save_kv_checkpoint: cannot open " + tmp);
+        os.write(kCheckpointMagic, 4);
+        write_pod(os, kCheckpointFormat);
+        write_pod(os, version);
+        write_pod(os, static_cast<std::uint32_t>(records.size()));
+        for (const auto& rec : records) {
+            write_pod(os, static_cast<std::uint64_t>(rec.size()));
+            os.write(reinterpret_cast<const char*>(rec.data()), static_cast<std::streamsize>(rec.size()));
+        }
+        if (!os.flush()) throw std::runtime_error("save_kv_checkpoint: write failed for " + tmp);
+    }
+    std::filesystem::rename(tmp, path);
+}
+
+void TransferQueueController::load_kv_checkpoint(const std::string& path) {
+    std::ifstream is(path, std::ios::binary);
+    if (!is) throw std::runtime_error("load_kv_checkpoint: cannot open " + path);
+    char magic[4];
+    is.read(magic, 4);
+    if (!is || std::memcmp(magic, kCheckpointMagic, 4) != 0) {
+        throw std::runtime_error("load_kv_checkpoint: " + path + " is not a TransferQueue checkpoint");
+    }
+    if (read_pod<std::uint32_t>(is) != kCheckpointFormat) {
+        throw std::runtime_error("load_kv_checkpoint: unsupported checkpoint format in " + path);
+    }
+    const auto version = read_pod<std::int64_t>(is);
+    const auto count = read_pod<std::uint32_t>(is);
+    std::vector<Message> records;
+    records.reserve(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const auto len = read_pod<std::uint64_t>(is);
+        std::vector<std::uint8_t> bytes(len);
+        is.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(len));
+        if (!is) throw std::runtime_error("load_kv_checkpoint: truncated checkpoint file");
+        records.push_back(Message::deserialize(bytes));
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& [partition_id, partition] : partitions_) {
+        (void)partition;
+        index_manager_.release_partition(partition_id);
+    }
+    partitions_.clear();
+    current_version_ = version;
+    // Claim every restored id before any partition is created: creating one
+    // pre-allocates an id, which must never be one we're about to restore.
+    for (const auto& rec : records) {
+        index_manager_.adopt_indexes(rec.body.partition_id, rec.body.sample_ids);
+    }
+    for (const auto& rec : records) {
+        const auto& body = rec.body;
+        ensure_partition_locked(body.partition_id);
+        auto* partition = find_partition(body.partition_id);
+        for (std::size_t i = 0; i < body.sample_ids.size(); ++i) {
+            const SampleId id = body.sample_ids[i];
+            partition->bind_key(body.keys[i], id);
+            if (!body.fields.empty()) {
+                partition->update_production_status(
+                    {id}, body.fields,
+                    body.sample_shard_indices[i] >= 0 ? std::optional<std::int32_t>(body.sample_shard_indices[i])
+                                                      : std::nullopt,
+                    body.sample_versions[i] >= 0 ? std::optional<std::int64_t>(body.sample_versions[i])
+                                                 : std::nullopt);
+            }
+        }
+        partition->merge_tags(body.sample_ids, body.tags);
+    }
 }
 
 }

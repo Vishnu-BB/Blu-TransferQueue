@@ -1,5 +1,6 @@
 #include "transferqueue/DataPartitionStatus.h"
 
+#include <algorithm>
 #include <chrono>
 #include <stdexcept>
 
@@ -184,7 +185,80 @@ void DataPartitionStatus::clear_data(const std::vector<SampleId>& ids, bool clea
         sample_version_.erase(id);
         sample_group_id_.erase(id);
         sample_produced_at_.erase(id);
+        sample_tag_.erase(id);
+        auto key_it = id_to_key_.find(id);
+        if (key_it != id_to_key_.end()) {
+            key_to_id_.erase(key_it->second);
+            id_to_key_.erase(key_it);
+        }
     }
+}
+
+std::vector<SampleId> DataPartitionStatus::ids_for_keys(const std::vector<std::string>& keys) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<SampleId> ids;
+    ids.reserve(keys.size());
+    for (const auto& key : keys) {
+        auto it = key_to_id_.find(key);
+        ids.push_back(it == key_to_id_.end() ? kMissingSample : it->second);
+    }
+    return ids;
+}
+
+void DataPartitionStatus::bind_key(const std::string& key, SampleId id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    key_to_id_[key] = id;
+    id_to_key_[id] = key;
+    sample_tag_.try_emplace(id);
+}
+
+void DataPartitionStatus::merge_tags(const std::vector<SampleId>& ids, const std::vector<Tag>& tags) {
+    if (ids.size() != tags.size()) {
+        throw std::invalid_argument("DataPartitionStatus::merge_tags: ids and tags must be the same length");
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        auto& tag = sample_tag_[ids[i]];
+        for (const auto& [name, value] : tags[i]) {
+            tag[name] = value;
+        }
+    }
+}
+
+std::vector<KVSampleSnapshot> DataPartitionStatus::kv_snapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<KVSampleSnapshot> out;
+    out.reserve(key_to_id_.size());
+    for (const auto& [key, id] : key_to_id_) {
+        KVSampleSnapshot snap;
+        snap.key = key;
+        snap.id = id;
+        if (auto it = sample_tag_.find(id); it != sample_tag_.end()) snap.tag = it->second;
+        if (auto it = sample_shard_.find(id); it != sample_shard_.end()) snap.shard = it->second;
+        if (auto it = sample_version_.find(id); it != sample_version_.end()) snap.version = it->second;
+        for (const auto& [field, produced] : production_by_field_) {
+            if (produced.count(id) != 0) snap.fields.push_back(field);
+        }
+        std::sort(snap.fields.begin(), snap.fields.end());
+        out.push_back(std::move(snap));
+    }
+    return out;
+}
+
+std::size_t DataPartitionStatus::key_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return key_to_id_.size();
+}
+
+std::vector<std::pair<std::string, Tag>> DataPartitionStatus::list_keys() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::pair<std::string, Tag>> out;
+    out.reserve(key_to_id_.size());
+    for (const auto& [key, id] : key_to_id_) {
+        auto tag_it = sample_tag_.find(id);
+        out.emplace_back(key, tag_it == sample_tag_.end() ? Tag{} : tag_it->second);
+    }
+    return out;
 }
 
 std::size_t DataPartitionStatus::total_samples_num() const {

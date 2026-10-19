@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -91,6 +92,52 @@ struct Harness {
 } // namespace
 
 int main() {
+    // ---- Regression: CLEAR_DATA must also clear controller metadata. Before
+    // the fix, a cleared sample still looked "produced": a later GET selected
+    // it, returned an empty record and marked it consumed. ----
+    {
+        Harness h;
+        tq::Record r;
+        r["reward"] = make_scalar_f32(1.0f);
+        h.client.put("p@clear", {"reward"}, {{1, r}, {2, r}});
+        h.client.clear_data("p@clear", {1});
+        CHECK(h.controller->ready_indexes("p@clear", {"reward"}, "trainer") == std::vector<tq::SampleId>{2});
+        auto got = h.client.get("p@clear", {"reward"}, "trainer", 10);
+        CHECK(got.size() == 1 && got.count(2) == 1 && got[2].count("reward") == 1);
+    }
+
+    // ---- Regression: a PUT that doesn't fit is refused, never parks a
+    // server worker thread. Five concurrent over-capacity writers would
+    // previously occupy all 4 workers and starve the CLEAR behind them. ----
+    {
+        auto controller = std::make_shared<tq::TransferQueueController>();
+        auto storage = std::make_shared<tq::SimpleStorageManager>(/*capacity_bytes=*/4);
+        tq::TransferQueueServer server("srv-full", controller, storage, std::make_shared<tq::FifoSampler>());
+        std::string addr = server.start("tcp://127.0.0.1:0");
+        tq::TransferQueueRpcClient client("cli", addr, /*timeout_ms=*/3000);
+        tq::Record r;
+        r["reward"] = make_scalar_f32(1.0f);  // 4 bytes: fills the store
+        client.put("p@full", {"reward"}, {{1, r}});
+
+        std::vector<std::thread> writers;
+        std::atomic<int> refused{0};
+        for (int i = 0; i < 5; ++i) {
+            writers.emplace_back([&, i] {
+                tq::TransferQueueRpcClient w("w" + std::to_string(i), addr, /*timeout_ms=*/3000);
+                try {
+                    w.put("p@full", {"reward"}, {{static_cast<tq::SampleId>(10 + i), r}});
+                } catch (const std::runtime_error&) {
+                    ++refused;
+                }
+            });
+        }
+        for (auto& t : writers) t.join();
+        CHECK(refused.load() == 5);
+        CHECK_NOTHROW(client.clear_data("p@full", {1}));  // still served promptly
+        CHECK_NOTHROW(client.put("p@full", {"reward"}, {{2, r}}));
+        server.stop();
+    }
+
     // ---- Success path for every RequestType the switch actually handles ----
     {
         Harness h;

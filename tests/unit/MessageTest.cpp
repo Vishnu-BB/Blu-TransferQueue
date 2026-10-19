@@ -53,6 +53,20 @@ const std::vector<RequestType> kAllRequestTypes = {
     RequestType::ADVANCE_VERSION_RESPONSE,
     RequestType::FIND_STRANDED_GROUPS,
     RequestType::FIND_STRANDED_GROUPS_RESPONSE,
+    RequestType::KV_RETRIEVE,
+    RequestType::KV_RETRIEVE_RESPONSE,
+    RequestType::KV_UPDATE,
+    RequestType::KV_UPDATE_RESPONSE,
+    RequestType::KV_LIST,
+    RequestType::KV_LIST_RESPONSE,
+    RequestType::KV_CLEAR,
+    RequestType::KV_CLEAR_RESPONSE,
+    RequestType::SAVE_CHECKPOINT,
+    RequestType::SAVE_CHECKPOINT_RESPONSE,
+    RequestType::LOAD_CHECKPOINT,
+    RequestType::LOAD_CHECKPOINT_RESPONSE,
+    RequestType::GET_STATS,
+    RequestType::GET_STATS_RESPONSE,
 };
 
 // Every FieldDtype value declared in BatchMeta.h, same caveat as above.
@@ -83,6 +97,11 @@ MessageBody make_fully_populated_body() {
     body.shard_registry_addresses = {"tcp://a:1", "tcp://b:2", "tcp://c:3"};
     body.sample_versions = {-1, 0, INT64_MAX, INT64_MIN, 42};
     body.current_version = INT64_MAX;
+    body.keys = {"uid-1", "uid-1_0_0", ""};
+    body.tags = {{{"status", std::string("finished")}, {"global_steps", std::int64_t{-7}},
+                  {"score", 0.25}, {"is_prompt", true}},
+                 {},
+                 {{"", std::string("")}}};
     return body;
 }
 
@@ -100,6 +119,8 @@ void check_body_equal(const MessageBody& a, const MessageBody& b) {
     CHECK(a.shard_index == b.shard_index);
     CHECK(a.address == b.address);
     CHECK(a.sample_shard_indices == b.sample_shard_indices);
+    CHECK(a.keys == b.keys);
+    CHECK(a.tags == b.tags);
     CHECK(a.shard_registry_indices == b.shard_registry_indices);
     CHECK(a.shard_registry_addresses == b.shard_registry_addresses);
     CHECK(a.sample_versions == b.sample_versions);

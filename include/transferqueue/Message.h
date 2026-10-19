@@ -45,6 +45,29 @@ enum class RequestType {
 
     FIND_STRANDED_GROUPS,
     FIND_STRANDED_GROUPS_RESPONSE,
+
+    // KV layer (verl's kv_* API), served by ControllerServer.
+    KV_RETRIEVE,           // keys (+flag=create) -> sample_ids + shard map
+    KV_RETRIEVE_RESPONSE,
+    KV_UPDATE,             // production status (+shard) and/or merged tags for sample_ids
+    KV_UPDATE_RESPONSE,
+    KV_LIST,               // partition -> keys + tags, no tensor data
+    KV_LIST_RESPONSE,
+    KV_CLEAR,              // drop keys' metadata, then their data on every shard
+    KV_CLEAR_RESPONSE,
+
+    // Checkpoint/restore (verl's tq.save_checkpoint / tq.load_checkpoint).
+    // To ControllerServer: body.address = checkpoint directory; it saves its
+    // own metadata and fans out to every shard. To StorageServer: body.address
+    // = that shard's file.
+    SAVE_CHECKPOINT,
+    SAVE_CHECKPOINT_RESPONSE,
+    LOAD_CHECKPOINT,
+    LOAD_CHECKPOINT_RESPONSE,
+
+    // Server counters for the metrics endpoint, returned as body.tags[0].
+    GET_STATS,
+    GET_STATS_RESPONSE,
 };
 
 std::string to_string(RequestType type);
@@ -80,6 +103,9 @@ struct MessageBody {
     std::vector<std::string> stranded_group_ids;
     std::vector<std::int32_t> stranded_group_sizes;
     std::vector<std::int64_t> stranded_group_ages_ms;
+
+    std::vector<std::string> keys;
+    std::vector<Tag> tags;
 };
 
 struct Message {

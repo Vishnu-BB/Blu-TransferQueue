@@ -1,12 +1,23 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <string>
+#include <unordered_map>
+#include <variant>
 #include <vector>
 
 namespace tq {
 
 using SampleId = std::uint64_t;
+
+// Returned by the KV lookups for a key that doesn't exist (and wasn't created).
+inline constexpr SampleId kMissingSample = std::numeric_limits<SampleId>::max();
+
+// KV-layer row metadata (verl's "tag"): status, global_steps, seq lens, ...
+// Same variant RL's KVBatchMeta.h uses, so tags cross the boundary as-is.
+using TagValue = std::variant<std::string, std::int64_t, double, bool>;
+using Tag = std::unordered_map<std::string, TagValue>;
 
 enum class FieldDtype : std::uint8_t {
     Int8,

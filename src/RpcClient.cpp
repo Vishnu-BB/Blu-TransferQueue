@@ -10,14 +10,24 @@ namespace tq {
 
 struct TransferQueueRpcClient::Impl {
     zmq::context_t ctx;
-    zmq::socket_t dealer{ctx, zmq::socket_type::dealer};
+    zmq::socket_t dealer;
+    std::string address;
+    int timeout_ms = 5000;
+
+    void connect() {
+        dealer = zmq::socket_t(ctx, zmq::socket_type::dealer);
+        dealer.set(zmq::sockopt::rcvtimeo, timeout_ms);
+        dealer.set(zmq::sockopt::linger, 0);
+        dealer.connect(address);
+    }
 };
 
-TransferQueueRpcClient::TransferQueueRpcClient(std::string client_id, const std::string& server_address)
+TransferQueueRpcClient::TransferQueueRpcClient(std::string client_id, const std::string& server_address,
+                                               int timeout_ms)
     : impl_(std::make_unique<Impl>()), client_id_(std::move(client_id)) {
-    impl_->dealer.set(zmq::sockopt::rcvtimeo, 5000);
-    impl_->dealer.set(zmq::sockopt::linger, 0);
-    impl_->dealer.connect(server_address);
+    impl_->address = server_address;
+    impl_->timeout_ms = timeout_ms;
+    impl_->connect();
 }
 
 TransferQueueRpcClient::~TransferQueueRpcClient() = default;
@@ -62,12 +72,16 @@ Message call(TransferQueueRpcClient::Impl& impl, Message request) {
     send_owned_buffer(impl.dealer, std::move(header), zmq::send_flags::sndmore);
     send_owned_buffer(impl.dealer, std::move(request.body.payload), zmq::send_flags::none);
 
+    // A reply that arrives after we gave up would otherwise sit in the DEALER
+    // queue and be returned as the NEXT call's answer -- a fresh socket drops it.
     zmq::message_t reply_header;
     if (!impl.dealer.recv(reply_header, zmq::recv_flags::none).has_value()) {
+        impl.connect();
         throw std::runtime_error("TransferQueueRpcClient: timed out waiting for a reply");
     }
     zmq::message_t reply_payload;
     if (!impl.dealer.recv(reply_payload, zmq::recv_flags::none).has_value()) {
+        impl.connect();
         throw std::runtime_error("TransferQueueRpcClient: timed out waiting for a reply payload");
     }
 
@@ -273,6 +287,86 @@ std::vector<StrandedGroup> TransferQueueRpcClient::find_stranded_groups(const st
         result.push_back(std::move(group));
     }
     return result;
+}
+
+TransferQueueRpcClient::KvRetrieveResult TransferQueueRpcClient::kv_retrieve(const std::string& partition_id,
+                                                                            const std::vector<std::string>& keys,
+                                                                            bool create) {
+    MessageBody body;
+    body.partition_id = partition_id;
+    body.keys = keys;
+    body.flag = create;
+
+    auto response = call(*impl_, Message::create(RequestType::KV_RETRIEVE, client_id_, body));
+    throw_if_error(response);
+
+    KvRetrieveResult result;
+    result.sample_ids = std::move(response.body.sample_ids);
+    result.sample_shard_indices = std::move(response.body.sample_shard_indices);
+    for (std::size_t i = 0; i < response.body.shard_registry_indices.size(); ++i) {
+        result.shard_addresses[response.body.shard_registry_indices[i]] = response.body.shard_registry_addresses[i];
+    }
+    return result;
+}
+
+void TransferQueueRpcClient::kv_update(const std::string& partition_id, const std::vector<SampleId>& sample_ids,
+                                       const std::vector<std::string>& fields,
+                                       const std::vector<FieldDtype>& field_dtypes,
+                                       const std::vector<std::int32_t>& sample_shard_indices,
+                                       const std::vector<Tag>& tags) {
+    MessageBody body;
+    body.partition_id = partition_id;
+    body.sample_ids = sample_ids;
+    body.fields = fields;
+    body.field_dtypes = field_dtypes;
+    body.sample_shard_indices = sample_shard_indices;
+    body.tags = tags;
+
+    auto response = call(*impl_, Message::create(RequestType::KV_UPDATE, client_id_, body));
+    throw_if_error(response);
+}
+
+std::vector<std::pair<std::string, Tag>> TransferQueueRpcClient::kv_list(const std::string& partition_id) {
+    MessageBody body;
+    body.partition_id = partition_id;
+
+    auto response = call(*impl_, Message::create(RequestType::KV_LIST, client_id_, body));
+    throw_if_error(response);
+
+    std::vector<std::pair<std::string, Tag>> result;
+    result.reserve(response.body.keys.size());
+    for (std::size_t i = 0; i < response.body.keys.size(); ++i) {
+        result.emplace_back(std::move(response.body.keys[i]),
+                            i < response.body.tags.size() ? std::move(response.body.tags[i]) : Tag{});
+    }
+    return result;
+}
+
+void TransferQueueRpcClient::kv_clear(const std::string& partition_id, const std::vector<std::string>& keys) {
+    MessageBody body;
+    body.partition_id = partition_id;
+    body.keys = keys;
+
+    auto response = call(*impl_, Message::create(RequestType::KV_CLEAR, client_id_, body));
+    throw_if_error(response);
+}
+
+void TransferQueueRpcClient::save_checkpoint(const std::string& path) {
+    MessageBody body;
+    body.address = path;
+    throw_if_error(call(*impl_, Message::create(RequestType::SAVE_CHECKPOINT, client_id_, body)));
+}
+
+void TransferQueueRpcClient::load_checkpoint(const std::string& path) {
+    MessageBody body;
+    body.address = path;
+    throw_if_error(call(*impl_, Message::create(RequestType::LOAD_CHECKPOINT, client_id_, body)));
+}
+
+Tag TransferQueueRpcClient::get_stats() {
+    auto response = call(*impl_, Message::create(RequestType::GET_STATS, client_id_, {}));
+    throw_if_error(response);
+    return response.body.tags.empty() ? Tag{} : std::move(response.body.tags[0]);
 }
 
 }

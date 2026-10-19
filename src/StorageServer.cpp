@@ -24,7 +24,13 @@ Message StorageServer::handle_request(const Message& request) {
             }
             meta.partition_ids.assign(meta.sample_ids.size(), body.partition_id);
             meta.fields = body.fields;
-            storage_->put_data(meta, data);
+            if (!storage_->try_put_data(meta, data)) {
+                MessageBody response_body;
+                response_body.success = false;
+                response_body.error_message = "storage full: not enough free capacity for this batch -- clear "
+                                              "consumed samples and retry";
+                return Message::create(RequestType::PUT_DATA_RESPONSE, server_id(), response_body, request.sender_id);
+            }
 
             MessageBody response_body;
             response_body.success = true;
@@ -54,6 +60,31 @@ Message StorageServer::handle_request(const Message& request) {
             MessageBody response_body;
             response_body.success = true;
             return Message::create(RequestType::CLEAR_DATA_RESPONSE, server_id(), response_body, request.sender_id);
+        }
+
+        case RequestType::SAVE_CHECKPOINT:
+        case RequestType::LOAD_CHECKPOINT: {
+            const bool save = request.request_type == RequestType::SAVE_CHECKPOINT;
+            if (save) {
+                storage_->save(body.address);
+            } else {
+                storage_->load(body.address);
+            }
+            MessageBody response_body;
+            response_body.success = true;
+            return Message::create(save ? RequestType::SAVE_CHECKPOINT_RESPONSE : RequestType::LOAD_CHECKPOINT_RESPONSE,
+                                   server_id(), response_body, request.sender_id);
+        }
+
+        case RequestType::GET_STATS: {
+            Tag stats = request_stats();
+            for (auto& [name, value] : storage_->stats()) {
+                stats[name] = std::move(value);
+            }
+            MessageBody response_body;
+            response_body.success = true;
+            response_body.tags.push_back(std::move(stats));
+            return Message::create(RequestType::GET_STATS_RESPONSE, server_id(), response_body, request.sender_id);
         }
 
         default: {

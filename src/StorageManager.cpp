@@ -1,6 +1,9 @@
 #include "transferqueue/StorageManager.h"
 
 #include <algorithm>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <istream>
 #include <memory>
 #include <ostream>
@@ -37,6 +40,31 @@ FieldDtype to_field_dtype(OwnTensor::Dtype dtype) {
 }
 
 namespace {
+// Leading marker byte: OwnTensor has no zero-size tensors, so this keeps ""
+// representable, and lets tensor_bytes() reject a tensor bytes_tensor() didn't write.
+constexpr std::uint8_t kBytesMarker = 0xB7;
+} // namespace
+
+OwnTensor::Tensor bytes_tensor(std::string_view bytes) {
+    OwnTensor::Tensor t(OwnTensor::Shape{{static_cast<std::int64_t>(bytes.size() + 1)}}, OwnTensor::Dtype::UInt8);
+    auto* out = static_cast<std::uint8_t*>(t.data());
+    out[0] = kBytesMarker;
+    if (!bytes.empty()) {
+        std::memcpy(out + 1, bytes.data(), bytes.size());
+    }
+    return t;
+}
+
+std::string tensor_bytes(const OwnTensor::Tensor& tensor) {
+    if (tensor.dtype() != OwnTensor::Dtype::UInt8 || tensor.ndim() != 1 || tensor.numel() < 1 ||
+        static_cast<const std::uint8_t*>(tensor.data())[0] != kBytesMarker) {
+        throw std::invalid_argument("tensor_bytes: not a bytes field (expected a tensor written by bytes_tensor)");
+    }
+    const auto* data = static_cast<const char*>(tensor.data());
+    return std::string(data + 1, data + tensor.nbytes());
+}
+
+namespace {
 
 std::unordered_map<SampleId, std::string> partition_lookup(const BatchMeta& meta) {
     if (meta.partition_ids.size() != meta.sample_ids.size()) {
@@ -57,6 +85,15 @@ std::unordered_map<SampleId, std::string> partition_lookup(const BatchMeta& meta
 SimpleStorageManager::SimpleStorageManager(std::size_t capacity_bytes) : capacity_bytes_(capacity_bytes) {}
 
 void SimpleStorageManager::put_data(const BatchMeta& meta, const std::unordered_map<SampleId, Record>& data) {
+    put_impl(meta, data, /*wait=*/true);
+}
+
+bool SimpleStorageManager::try_put_data(const BatchMeta& meta, const std::unordered_map<SampleId, Record>& data) {
+    return put_impl(meta, data, /*wait=*/false);
+}
+
+bool SimpleStorageManager::put_impl(const BatchMeta& meta, const std::unordered_map<SampleId, Record>& data,
+                                    bool wait) {
     auto partition_of = partition_lookup(meta);
 
     // meta.fields is scanned once per (sample, field) pair below, twice
@@ -82,7 +119,11 @@ void SimpleStorageManager::put_data(const BatchMeta& meta, const std::unordered_
                                          std::to_string(incoming_bytes) + " bytes exceeds total capacity of " +
                                          std::to_string(capacity_bytes_) + " bytes -- can never fit, even empty");
         }
-        space_available_.wait(lock, [&] { return current_bytes_ + incoming_bytes <= capacity_bytes_; });
+        auto fits = [&] { return current_bytes_ + incoming_bytes <= capacity_bytes_; };
+        if (!wait && !fits()) {
+            return false;
+        }
+        space_available_.wait(lock, fits);
     }
 
     for (const auto& [id, record] : data) {
@@ -98,6 +139,7 @@ void SimpleStorageManager::put_data(const BatchMeta& meta, const std::unordered_
             }
         }
     }
+    return true;
 }
 
 std::unordered_map<SampleId, Record> SimpleStorageManager::get_data(const BatchMeta& meta) {
@@ -243,28 +285,6 @@ public:
         setg(begin, begin, begin + size);
     }
 
-protected:
-    // Needed for tellg()/seekg() -- load_tensor_view() below uses tellg()
-    // to find each tensor's raw-data start offset (so it can view it in
-    // place instead of reading/copying it) and seekg() to skip past it.
-    pos_type seekoff(off_type off, std::ios_base::seekdir dir, std::ios_base::openmode) override {
-        char* base = nullptr;
-        switch (dir) {
-            case std::ios_base::beg: base = eback() + off; break;
-            case std::ios_base::cur: base = gptr() + off; break;
-            case std::ios_base::end: base = egptr() + off; break;
-            default: return pos_type(off_type(-1));
-        }
-        if (base < eback() || base > egptr()) {
-            return pos_type(off_type(-1));
-        }
-        setg(eback(), base, egptr());
-        return pos_type(base - eback());
-    }
-
-    pos_type seekpos(pos_type pos, std::ios_base::openmode which) override {
-        return seekoff(off_type(pos), std::ios_base::beg, which);
-    }
 };
 
 std::size_t serialized_tensor_size(const OwnTensor::Tensor& tensor) {
@@ -291,71 +311,6 @@ std::size_t serialized_batch_size(const std::unordered_map<SampleId, Record>& da
     return size;
 }
 
-// OwnTensor::load_tensor always allocates a fresh Tensor and copies the raw
-// data into it -- for a batch of 9,216 (sample, field) tensors, that's
-// 9,216 separate heap allocations plus 9,216 memcpy's, confirmed as a real,
-// measured bottleneck (docs/TransferQueue-Benchmark.md's "Bottleneck 2"/
-// "Bottleneck 5"). This is the zero-allocation counterpart: it parses the
-// identical tensor header (duplicating OwnTensor::save_tensor's wire
-// format -- magic/dtype/rank/dims -- on purpose, since Tensor::from_blob's
-// view needs the exact byte offset the data starts at, which a
-// general-purpose, stream-agnostic API like OwnTensor::load_tensor has no
-// reason to expose) and then constructs a VIEW directly into `owner`'s own
-// memory at the stream's current position instead of allocating and
-// copying. `owner` is captured by the resulting Tensor's Storage (see
-// Tensor::from_blob) as a keep-alive, so the one combined buffer
-// deserialize_batch copies the wire bytes into outlives every tensor
-// viewing into it for exactly as long as needed -- including well past
-// this call, once stored into SimpleStorageManager::rows_.
-OwnTensor::Tensor load_tensor_view(std::istream& is, const std::shared_ptr<std::vector<std::uint8_t>>& owner) {
-    char magic[4];
-    is.read(magic, 4);
-    if (!is) {
-        throw std::invalid_argument("deserialize_batch: truncated tensor header");
-    }
-    if (std::string(magic, 4) == "TNS0") {
-        return OwnTensor::Tensor(); // invalid/default -- matches OwnTensor::load_tensor's own short form
-    }
-    if (std::string(magic, 4) != "TNS1") {
-        throw std::invalid_argument("deserialize_batch: invalid tensor format");
-    }
-
-    int dtype_val = 0;
-    is.read(reinterpret_cast<char*>(&dtype_val), sizeof(int));
-    int rank = 0;
-    is.read(reinterpret_cast<char*>(&rank), sizeof(int));
-    if (!is || rank < 0) {
-        throw std::invalid_argument("deserialize_batch: truncated tensor header");
-    }
-    auto dtype = static_cast<OwnTensor::Dtype>(dtype_val);
-
-    std::vector<std::int64_t> dims(static_cast<std::size_t>(rank));
-    for (auto& d : dims) {
-        is.read(reinterpret_cast<char*>(&d), sizeof(std::int64_t));
-    }
-    if (!is) {
-        throw std::invalid_argument("deserialize_batch: truncated tensor header");
-    }
-    OwnTensor::Shape shape({dims});
-
-    std::size_t nbytes = OwnTensor::Tensor::dtype_size(dtype);
-    for (std::int64_t d : dims) {
-        nbytes *= static_cast<std::size_t>(d);
-    }
-
-    auto pos = static_cast<std::size_t>(is.tellg());
-    if (pos + nbytes > owner->size()) {
-        throw std::invalid_argument("deserialize_batch: truncated tensor data");
-    }
-    OwnTensor::Tensor tensor = OwnTensor::Tensor::from_blob(
-        owner->data() + pos, shape, dtype, OwnTensor::DeviceIndex(OwnTensor::Device::CPU), owner);
-    is.seekg(static_cast<std::streamoff>(pos + nbytes));
-    if (!is) {
-        throw std::invalid_argument("deserialize_batch: truncated tensor data");
-    }
-    return tensor;
-}
-
 } // namespace
 
 std::vector<std::uint8_t> serialize_batch(const std::unordered_map<SampleId, Record>& data) {
@@ -375,13 +330,11 @@ std::vector<std::uint8_t> serialize_batch(const std::unordered_map<SampleId, Rec
 }
 
 std::unordered_map<SampleId, Record> deserialize_batch(std::vector<std::uint8_t> bytes) {
-    // `bytes` is already this function's own copy (or the caller's moved-in
-    // buffer, paying zero extra copies -- see the declaration's comment).
-    // Every view tensor below shares ownership of it, down from the old
-    // per-tensor allocate-and-copy this replaces (9,216 of them, for a
-    // 1024-sample x 9-field batch).
-    auto owned = std::make_shared<std::vector<std::uint8_t>>(std::move(bytes));
-    VectorReadBuf buf(owned->data(), owned->size());
+    // ponytail: OwnTensor::load_tensor allocates + copies each tensor (one
+    // heap alloc per (sample, field)). Zero-copy views would need a
+    // keep-alive view API in Tensor-Implementations; add it if this shows up
+    // in the benchmark.
+    VectorReadBuf buf(bytes.data(), bytes.size());
     std::istream is(&buf);
 
     std::unordered_map<SampleId, Record> data;
@@ -392,11 +345,98 @@ std::unordered_map<SampleId, Record> deserialize_batch(std::vector<std::uint8_t>
         Record record;
         for (std::uint32_t f = 0; f < field_count; ++f) {
             std::string field = read_string(is);
-            record[field] = load_tensor_view(is, owned);
+            record[field] = OwnTensor::load_tensor(is);
         }
         data[id] = std::move(record);
     }
     return data;
+}
+
+namespace {
+constexpr char kShardMagic[4] = {'T', 'Q', 'S', 'H'};
+constexpr std::uint32_t kShardFormat = 1;
+} // namespace
+
+void SimpleStorageManager::save(const std::string& path) const {
+    // Serialize under the lock (consistent snapshot), write outside it.
+    std::vector<std::pair<std::string, std::vector<std::uint8_t>>> partitions;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [partition_id, rows] : rows_) {
+            partitions.emplace_back(partition_id, serialize_batch(rows));
+        }
+    }
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream os(tmp, std::ios::binary | std::ios::trunc);
+        if (!os) throw std::runtime_error("SimpleStorageManager::save: cannot open " + tmp);
+        os.write(kShardMagic, 4);
+        os.write(reinterpret_cast<const char*>(&kShardFormat), sizeof(kShardFormat));
+        auto count = static_cast<std::uint32_t>(partitions.size());
+        os.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        for (const auto& [partition_id, bytes] : partitions) {
+            auto id_len = static_cast<std::uint32_t>(partition_id.size());
+            auto len = static_cast<std::uint64_t>(bytes.size());
+            os.write(reinterpret_cast<const char*>(&id_len), sizeof(id_len));
+            os.write(partition_id.data(), id_len);
+            os.write(reinterpret_cast<const char*>(&len), sizeof(len));
+            os.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(len));
+        }
+        if (!os.flush()) throw std::runtime_error("SimpleStorageManager::save: write failed for " + tmp);
+    }
+    std::filesystem::rename(tmp, path);
+}
+
+void SimpleStorageManager::load(const std::string& path) {
+    std::ifstream is(path, std::ios::binary);
+    if (!is) throw std::runtime_error("SimpleStorageManager::load: cannot open " + path);
+    auto fail = [&] { throw std::runtime_error("SimpleStorageManager::load: corrupt or truncated " + path); };
+    char magic[4];
+    std::uint32_t format = 0, count = 0;
+    is.read(magic, 4);
+    is.read(reinterpret_cast<char*>(&format), sizeof(format));
+    is.read(reinterpret_cast<char*>(&count), sizeof(count));
+    if (!is || std::memcmp(magic, kShardMagic, 4) != 0 || format != kShardFormat) fail();
+
+    std::unordered_map<std::string, std::unordered_map<SampleId, Record>> rows;
+    std::size_t bytes_total = 0;
+    for (std::uint32_t p = 0; p < count; ++p) {
+        std::uint32_t id_len = 0;
+        is.read(reinterpret_cast<char*>(&id_len), sizeof(id_len));
+        std::string partition_id(id_len, '\0');
+        is.read(partition_id.data(), id_len);
+        std::uint64_t len = 0;
+        is.read(reinterpret_cast<char*>(&len), sizeof(len));
+        if (!is) fail();
+        std::vector<std::uint8_t> bytes(len);
+        is.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(len));
+        if (!is) fail();
+        auto batch = deserialize_batch(std::move(bytes));
+        for (const auto& [id, record] : batch) {
+            for (const auto& [field, value] : record) {
+                (void)field;
+                bytes_total += value.nbytes();
+            }
+        }
+        rows[partition_id] = std::move(batch);
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    rows_ = std::move(rows);
+    current_bytes_ = bytes_total;
+    space_available_.notify_all();
+}
+
+Tag SimpleStorageManager::stats() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::int64_t rows = 0;
+    for (const auto& [partition_id, partition_rows] : rows_) {
+        (void)partition_id;
+        rows += static_cast<std::int64_t>(partition_rows.size());
+    }
+    return {{"bytes", static_cast<std::int64_t>(current_bytes_)},
+            {"rows", rows},
+            {"capacity_bytes", static_cast<std::int64_t>(capacity_bytes_)}};
 }
 
 Message make_batch_message(RequestType type, const std::string& sender_id, MessageBody body,

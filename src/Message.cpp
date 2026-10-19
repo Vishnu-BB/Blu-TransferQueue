@@ -35,6 +35,20 @@ std::string to_string(RequestType type) {
         case RequestType::ADVANCE_VERSION_RESPONSE: return "ADVANCE_VERSION_RESPONSE";
         case RequestType::FIND_STRANDED_GROUPS: return "FIND_STRANDED_GROUPS";
         case RequestType::FIND_STRANDED_GROUPS_RESPONSE: return "FIND_STRANDED_GROUPS_RESPONSE";
+        case RequestType::KV_RETRIEVE: return "KV_RETRIEVE";
+        case RequestType::KV_RETRIEVE_RESPONSE: return "KV_RETRIEVE_RESPONSE";
+        case RequestType::KV_UPDATE: return "KV_UPDATE";
+        case RequestType::KV_UPDATE_RESPONSE: return "KV_UPDATE_RESPONSE";
+        case RequestType::KV_LIST: return "KV_LIST";
+        case RequestType::KV_LIST_RESPONSE: return "KV_LIST_RESPONSE";
+        case RequestType::KV_CLEAR: return "KV_CLEAR";
+        case RequestType::KV_CLEAR_RESPONSE: return "KV_CLEAR_RESPONSE";
+        case RequestType::SAVE_CHECKPOINT: return "SAVE_CHECKPOINT";
+        case RequestType::SAVE_CHECKPOINT_RESPONSE: return "SAVE_CHECKPOINT_RESPONSE";
+        case RequestType::LOAD_CHECKPOINT: return "LOAD_CHECKPOINT";
+        case RequestType::LOAD_CHECKPOINT_RESPONSE: return "LOAD_CHECKPOINT_RESPONSE";
+        case RequestType::GET_STATS: return "GET_STATS";
+        case RequestType::GET_STATS_RESPONSE: return "GET_STATS_RESPONSE";
     }
     throw std::invalid_argument("to_string(RequestType): unknown value");
 }
@@ -56,7 +70,7 @@ std::uint8_t read_u8(const std::uint8_t* data, std::size_t size, std::size_t& of
 
 RequestType read_request_type(const std::uint8_t* data, std::size_t size, std::size_t& offset) {
     std::uint8_t value = read_u8(data, size, offset);
-    if (value > static_cast<std::uint8_t>(RequestType::FIND_STRANDED_GROUPS_RESPONSE)) {
+    if (value > static_cast<std::uint8_t>(RequestType::GET_STATS_RESPONSE)) {
         throw std::invalid_argument("Message::deserialize: invalid request_type byte");
     }
     return static_cast<RequestType>(value);
@@ -227,6 +241,59 @@ std::vector<std::uint8_t> read_bytes(const std::uint8_t* data, std::size_t size,
     return bytes;
 }
 
+// Tag wire form: u32 count, then per tag u32 entries, then per entry
+// name + type byte (variant index) + value.
+void write_tags(std::vector<std::uint8_t>& out, const std::vector<Tag>& tags) {
+    write_u32(out, static_cast<std::uint32_t>(tags.size()));
+    for (const auto& tag : tags) {
+        write_u32(out, static_cast<std::uint32_t>(tag.size()));
+        for (const auto& [name, value] : tag) {
+            write_string(out, name);
+            out.push_back(static_cast<std::uint8_t>(value.index()));
+            switch (value.index()) {
+                case 0: write_string(out, std::get<std::string>(value)); break;
+                case 1: write_i64(out, std::get<std::int64_t>(value)); break;
+                case 2: {
+                    std::uint64_t bits;
+                    double d = std::get<double>(value);
+                    std::memcpy(&bits, &d, sizeof(bits));
+                    write_u64(out, bits);
+                    break;
+                }
+                case 3: out.push_back(std::get<bool>(value) ? 1 : 0); break;
+            }
+        }
+    }
+}
+
+std::vector<Tag> read_tags(const std::uint8_t* data, std::size_t size, std::size_t& offset) {
+    std::uint32_t count = read_u32(data, size, offset);
+    std::vector<Tag> tags;
+    tags.reserve(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        Tag tag;
+        std::uint32_t entries = read_u32(data, size, offset);
+        for (std::uint32_t e = 0; e < entries; ++e) {
+            std::string name = read_string(data, size, offset);
+            switch (read_u8(data, size, offset)) {
+                case 0: tag[name] = read_string(data, size, offset); break;
+                case 1: tag[name] = read_i64(data, size, offset); break;
+                case 2: {
+                    std::uint64_t bits = read_u64(data, size, offset);
+                    double d;
+                    std::memcpy(&d, &bits, sizeof(d));
+                    tag[name] = d;
+                    break;
+                }
+                case 3: tag[name] = read_u8(data, size, offset) != 0; break;
+                default: throw std::invalid_argument("Message::deserialize: invalid tag value type");
+            }
+        }
+        tags.push_back(std::move(tag));
+    }
+    return tags;
+}
+
 std::string make_request_id() {
     static thread_local std::mt19937_64 rng(std::random_device{}());
     static const char* kHex = "0123456789abcdef";
@@ -300,6 +367,8 @@ std::vector<std::uint8_t> serialize_impl(const Message& msg, const std::vector<s
     write_string_list(out, msg.body.stranded_group_ids);
     write_i32_list(out, msg.body.stranded_group_sizes);
     write_i64_list(out, msg.body.stranded_group_ages_ms);
+    write_string_list(out, msg.body.keys);
+    write_tags(out, msg.body.tags);
 
     return out;
 }
@@ -374,6 +443,8 @@ Message Message::deserialize(const std::vector<std::uint8_t>& bytes) {
     msg.body.stranded_group_ids = read_string_list(data, size, offset);
     msg.body.stranded_group_sizes = read_i32_list(data, size, offset);
     msg.body.stranded_group_ages_ms = read_i64_list(data, size, offset);
+    msg.body.keys = read_string_list(data, size, offset);
+    msg.body.tags = read_tags(data, size, offset);
 
     return msg;
 }

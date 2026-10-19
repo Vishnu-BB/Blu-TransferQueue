@@ -13,7 +13,9 @@ class TransferQueueRpcClient {
 public:
     struct Impl;
 
-    TransferQueueRpcClient(std::string client_id, const std::string& server_address);
+    // timeout_ms bounds every call; on timeout the socket is rebuilt so a late
+    // reply can't be mistaken for the next call's answer.
+    TransferQueueRpcClient(std::string client_id, const std::string& server_address, int timeout_ms = 5000);
     ~TransferQueueRpcClient();
 
     TransferQueueRpcClient(const TransferQueueRpcClient&) = delete;
@@ -61,6 +63,30 @@ public:
     std::vector<StrandedGroup> find_stranded_groups(const std::string& partition_id,
                                                      const std::vector<std::string>& fields,
                                                      const std::string& task_name, std::int64_t max_age_ms);
+
+    // ---- KV layer (ControllerServer) ----
+    struct KvRetrieveResult {
+        std::vector<SampleId> sample_ids;               // kMissingSample for unknown keys (create=false)
+        std::vector<std::int32_t> sample_shard_indices; // -1 = no data written yet
+        std::unordered_map<std::int32_t, std::string> shard_addresses; // every registered shard
+    };
+    KvRetrieveResult kv_retrieve(const std::string& partition_id, const std::vector<std::string>& keys, bool create);
+
+    // Marks `fields` produced for sample_ids (on the given per-sample shards)
+    // and/or merges per-sample tags. Either fields or tags may be empty.
+    void kv_update(const std::string& partition_id, const std::vector<SampleId>& sample_ids,
+                   const std::vector<std::string>& fields, const std::vector<FieldDtype>& field_dtypes,
+                   const std::vector<std::int32_t>& sample_shard_indices, const std::vector<Tag>& tags);
+
+    std::vector<std::pair<std::string, Tag>> kv_list(const std::string& partition_id);
+    void kv_clear(const std::string& partition_id, const std::vector<std::string>& keys);
+
+    // Controller: path is a checkpoint directory (it fans out to the shards).
+    // StorageServer: path is that shard's file.
+    void save_checkpoint(const std::string& path);
+    void load_checkpoint(const std::string& path);
+
+    Tag get_stats();  // the server's counters/gauges (see RpcServerBase::request_stats)
 
 private:
     std::unique_ptr<Impl> impl_;
