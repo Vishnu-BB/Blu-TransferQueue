@@ -67,6 +67,10 @@ const std::vector<RequestType> kAllRequestTypes = {
     RequestType::LOAD_CHECKPOINT_RESPONSE,
     RequestType::GET_STATS,
     RequestType::GET_STATS_RESPONSE,
+    RequestType::COMMIT_LOAD_CHECKPOINT,
+    RequestType::COMMIT_LOAD_CHECKPOINT_RESPONSE,
+    RequestType::ABORT_LOAD_CHECKPOINT,
+    RequestType::ABORT_LOAD_CHECKPOINT_RESPONSE,
 };
 
 // Every FieldDtype value declared in BatchMeta.h, same caveat as above.

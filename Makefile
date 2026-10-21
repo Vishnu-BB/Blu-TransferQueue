@@ -51,6 +51,8 @@ CUDA_LIB  := $(CUDA_HOME)lib64
 CORE_SRCS := src/BatchMeta.cpp src/Message.cpp src/PartitionIndexManager.cpp src/DataPartitionStatus.cpp \
              src/Controller.cpp src/Sampler.cpp src/GRPOGroupNSampler.cpp src/GroupRouter.cpp
 
+
+.PHONY: checkpoint_inspect
 .PHONY: smoke test_tensor test_rpc test_correctness test_distributed test_distributed_n_to_m server_bin controller_server_bin storage_server_bin demo_pipeline benchmark control_plane_benchmark unit_tests deps lib clean
 
 smoke: $(BUILD_DIR)/test_scaffold_smoke
@@ -69,8 +71,10 @@ TENSOR_TEST_SRCS := $(CORE_SRCS) $(TENSOR_SRCS) tests/test_tensor_smoke.cpp
 TENSOR_INCLUDES := -I$(TENSOR_IMPL_DIR)/include -I$(CUDA_INC)
 # Mirrors Tensor-Implementations/Makefile's own TENSOR_LDLIBS -- libtensor.a
 # pulls in its CUDA allocator/NVML code even for CPU-only tensor use.
+# Absolute rpaths so the binaries run from any working directory, not only from Blu-TransferQueue/.
 TENSOR_LDFLAGS := -L$(TENSOR_IMPL_DIR)/lib -L$(CUDA_LIB) -L$(PROFILER_DIR)/lib \
-                   -Wl,-rpath,$(TENSOR_IMPL_DIR)/lib -Wl,-rpath,$(CUDA_LIB) -Wl,-rpath,$(PROFILER_DIR)/lib
+                   -Wl,-rpath,$(abspath $(TENSOR_IMPL_DIR)/lib) -Wl,-rpath,$(CUDA_LIB) \
+                   -Wl,-rpath,$(abspath $(PROFILER_DIR)/lib)
 TENSOR_LDLIBS  := -ltensor -lblublas -lcudart -lcurand -lcublas -lcublasLt -lgomp -lnvidia-ml -lprofiler -lcuda -lstdc++fs -pthread
 
 test_tensor: $(BUILD_DIR)/test_tensor_smoke
@@ -182,6 +186,17 @@ $(BUILD_DIR)/control_plane_benchmark: $(CONTROL_PLANE_BENCHMARK_SRCS)
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(CONTROL_PLANE_BENCHMARK_SRCS) -pthread -o $@
 
+# ---- Checkpoint inspector: human-readable dump of a checkpoint directory
+#      (controller.tqck + shard-<i>.tqsh), read-only. Usage:
+#      ./build/checkpoint_inspect <checkpoint_dir> [max_rows_per_partition=5]
+INSPECT_SRCS := $(CORE_SRCS) src/StorageManager.cpp tools/checkpoint_inspect_main.cpp
+
+checkpoint_inspect: $(BUILD_DIR)/checkpoint_inspect
+
+$(BUILD_DIR)/checkpoint_inspect: $(INSPECT_SRCS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(TENSOR_INCLUDES) -DWITH_CUDA $(INSPECT_SRCS) $(TENSOR_LDFLAGS) $(TENSOR_LDLIBS) -o $@
+
 # ============================================================
 # Per-component unit tests (tests/unit/*Test.cpp) -- one file per component,
 # assert()-based like every other test here (no new test-framework
@@ -209,7 +224,7 @@ $(BUILD_DIR)/unit_rpc_%: tests/unit/%.cpp $(CORE_SRCS) $(TENSOR_SRCS) $(RPC_SRCS
 UNIT_CORE_TESTS   := BatchMetaTest PartitionIndexManagerTest DataPartitionStatusTest ControllerTest \
                      MessageTest FifoSamplerTest GRPOGroupNSamplerTest GroupRouterTest
 UNIT_TENSOR_TESTS := StorageManagerTest ClientTest
-UNIT_RPC_TESTS    := ServerTest RpcClientTest ControllerServerTest StorageServerTest KVClientTest
+UNIT_RPC_TESTS    := ServerTest RpcClientTest ControllerServerTest StorageServerTest KVClientTest CheckpointTest
 
 UNIT_TEST_BINS := $(addprefix $(BUILD_DIR)/unit_core_,$(UNIT_CORE_TESTS)) \
                   $(addprefix $(BUILD_DIR)/unit_tensor_,$(UNIT_TENSOR_TESTS)) \

@@ -363,6 +363,14 @@ void TransferQueueRpcClient::load_checkpoint(const std::string& path) {
     throw_if_error(call(*impl_, Message::create(RequestType::LOAD_CHECKPOINT, client_id_, body)));
 }
 
+void TransferQueueRpcClient::commit_load_checkpoint() {
+    throw_if_error(call(*impl_, Message::create(RequestType::COMMIT_LOAD_CHECKPOINT, client_id_, {})));
+}
+
+void TransferQueueRpcClient::abort_load_checkpoint() {
+    throw_if_error(call(*impl_, Message::create(RequestType::ABORT_LOAD_CHECKPOINT, client_id_, {})));
+}
+
 Tag TransferQueueRpcClient::get_stats() {
     auto response = call(*impl_, Message::create(RequestType::GET_STATS, client_id_, {}));
     throw_if_error(response);

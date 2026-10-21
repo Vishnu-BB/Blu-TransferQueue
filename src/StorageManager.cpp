@@ -387,10 +387,10 @@ void SimpleStorageManager::save(const std::string& path) const {
     std::filesystem::rename(tmp, path);
 }
 
-void SimpleStorageManager::load(const std::string& path) {
+SimpleStorageManager::ShardFile SimpleStorageManager::read_shard_file(const std::string& path) {
     std::ifstream is(path, std::ios::binary);
-    if (!is) throw std::runtime_error("SimpleStorageManager::load: cannot open " + path);
-    auto fail = [&] { throw std::runtime_error("SimpleStorageManager::load: corrupt or truncated " + path); };
+    if (!is) throw std::runtime_error("SimpleStorageManager: cannot open " + path);
+    auto fail = [&] { throw std::runtime_error("SimpleStorageManager: corrupt or truncated " + path); };
     char magic[4];
     std::uint32_t format = 0, count = 0;
     is.read(magic, 4);
@@ -398,8 +398,7 @@ void SimpleStorageManager::load(const std::string& path) {
     is.read(reinterpret_cast<char*>(&count), sizeof(count));
     if (!is || std::memcmp(magic, kShardMagic, 4) != 0 || format != kShardFormat) fail();
 
-    std::unordered_map<std::string, std::unordered_map<SampleId, Record>> rows;
-    std::size_t bytes_total = 0;
+    ShardFile file;
     for (std::uint32_t p = 0; p < count; ++p) {
         std::uint32_t id_len = 0;
         is.read(reinterpret_cast<char*>(&id_len), sizeof(id_len));
@@ -415,16 +414,34 @@ void SimpleStorageManager::load(const std::string& path) {
         for (const auto& [id, record] : batch) {
             for (const auto& [field, value] : record) {
                 (void)field;
-                bytes_total += value.nbytes();
+                file.bytes += value.nbytes();
             }
         }
-        rows[partition_id] = std::move(batch);
+        file.rows[partition_id] = std::move(batch);
     }
+    return file;
+}
 
+void SimpleStorageManager::prepare_load(const std::string& path) {
+    ShardFile file = read_shard_file(path);
+    // Parsed and validated in full: only now does anything become visible, and
+    // only as a staged copy -- the live rows are untouched until commit_load().
     std::lock_guard<std::mutex> lock(mutex_);
-    rows_ = std::move(rows);
-    current_bytes_ = bytes_total;
+    staged_ = Staged{std::move(file.rows), file.bytes};
+}
+
+void SimpleStorageManager::commit_load() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!staged_) throw std::logic_error("SimpleStorageManager::commit_load: nothing prepared");
+    rows_ = std::move(staged_->rows);
+    current_bytes_ = staged_->bytes;
+    staged_.reset();
     space_available_.notify_all();
+}
+
+void SimpleStorageManager::abort_load() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    staged_.reset();
 }
 
 Tag SimpleStorageManager::stats() const {

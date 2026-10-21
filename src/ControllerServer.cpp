@@ -1,6 +1,8 @@
 #include "transferqueue/ControllerServer.h"
 
 #include <filesystem>
+#include <set>
+#include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -123,8 +125,47 @@ ControllerServer::ControllerServer(std::string server_id, std::shared_ptr<Transf
                                     std::shared_ptr<BaseSampler> sampler)
     : RpcServerBase(std::move(server_id)), controller_(std::move(controller)), sampler_(std::move(sampler)) {}
 
+void ControllerServer::CheckpointGate::lock_shared() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [&] { return !writer_ && writers_waiting_ == 0; });
+    ++readers_;
+}
+
+void ControllerServer::CheckpointGate::unlock_shared() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (--readers_ == 0) cv_.notify_all();
+}
+
+void ControllerServer::CheckpointGate::lock() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    ++writers_waiting_;
+    cv_.wait(lock, [&] { return !writer_ && readers_ == 0; });
+    --writers_waiting_;
+    writer_ = true;
+}
+
+void ControllerServer::CheckpointGate::unlock() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    writer_ = false;
+    cv_.notify_all();
+}
+
 Message ControllerServer::handle_request(const Message& request) {
     const auto& body = request.body;
+
+    // See CheckpointGate (ControllerServer.h).
+    const RequestType type = request.request_type;
+    const bool checkpointing = type == RequestType::SAVE_CHECKPOINT || type == RequestType::LOAD_CHECKPOINT;
+    const bool mutates_metadata = type == RequestType::KV_UPDATE || type == RequestType::KV_CLEAR ||
+                                  type == RequestType::CLEAR_PARTITION || type == RequestType::NOTIFY_DATA_UPDATE ||
+                                  (type == RequestType::KV_RETRIEVE && body.flag);
+    std::unique_lock<CheckpointGate> exclusive(checkpoint_gate_, std::defer_lock);
+    std::shared_lock<CheckpointGate> shared(checkpoint_gate_, std::defer_lock);
+    if (checkpointing) {
+        exclusive.lock();
+    } else if (mutates_metadata) {
+        shared.lock();
+    }
 
     switch (request.request_type) {
         case RequestType::HANDSHAKE: {
@@ -312,18 +353,57 @@ Message ControllerServer::handle_request(const Message& request) {
         }
 
         case RequestType::LOAD_CHECKPOINT: {
-            // Shards first: if any data file is missing or bad, the controller's
-            // metadata is left untouched. The checkpoint must come from a
-            // deployment with the same shard indices.
-            for (const auto& [shard, address] : controller_->shard_registry()) {
-                const auto path = shard_checkpoint_path(body.address, shard);
-                if (!std::filesystem::exists(path)) {
-                    throw std::runtime_error("LOAD_CHECKPOINT: missing " + path +
-                                             " (checkpoint taken with a different shard count?)");
-                }
-                TransferQueueRpcClient(server_id(), address, kShardCheckpointTimeoutMs).load_checkpoint(path);
+            // All-or-nothing: nothing live changes until every part of the checkpoint
+            // has been read and validated.
+            // 1. Parse the controller's metadata (no state touched).
+            auto checkpoint = TransferQueueController::parse_kv_checkpoint(controller_checkpoint_path(body.address));
+            // 2. The deployment must have exactly the shards the checkpoint was saved from;
+            //    otherwise keys would point at shards that aren't there.
+            const auto registry = controller_->shard_registry();
+            std::set<std::int32_t> deployed;
+            for (const auto& [shard, address] : registry) {
+                (void)address;
+                deployed.insert(shard);
             }
-            controller_->load_kv_checkpoint(controller_checkpoint_path(body.address));
+            const std::set<std::int32_t> saved(checkpoint.shard_indices.begin(), checkpoint.shard_indices.end());
+            if (deployed != saved) {
+                auto list = [](const std::set<std::int32_t>& s) {
+                    std::string out;
+                    for (std::int32_t i : s) out += (out.empty() ? "" : ",") + std::to_string(i);
+                    return "{" + out + "}";
+                };
+                throw std::runtime_error("LOAD_CHECKPOINT: checkpoint was saved from shards " + list(saved) +
+                                         " but this deployment has shards " + list(deployed) + " -- nothing loaded");
+            }
+            // 3. Stage every shard's file; on any failure, drop what was staged and stop.
+            std::vector<std::int32_t> staged;
+            try {
+                for (const auto& [shard, address] : registry) {
+                    const auto path = shard_checkpoint_path(body.address, shard);
+                    if (!std::filesystem::exists(path)) {
+                        throw std::runtime_error("LOAD_CHECKPOINT: missing " + path);
+                    }
+                    TransferQueueRpcClient(server_id(), address, kShardCheckpointTimeoutMs).load_checkpoint(path);
+                    staged.push_back(shard);
+                }
+            } catch (const std::exception& e) {
+                for (std::int32_t shard : staged) {
+                    try {
+                        TransferQueueRpcClient(server_id(), registry.at(shard), kShardCheckpointTimeoutMs)
+                            .abort_load_checkpoint();
+                    } catch (const std::exception&) {
+                        // Best effort: an unreachable shard keeps a staged copy it never commits.
+                    }
+                }
+                throw std::runtime_error(std::string(e.what()) + " -- nothing loaded");
+            }
+            // 4. Everything validated: commit the shards, then the metadata.
+            // ponytail: a shard dying between its stage and commit leaves that one shard
+            // stale while the rest commit; making that atomic too needs a commit log.
+            for (const auto& [shard, address] : registry) {
+                TransferQueueRpcClient(server_id(), address, kShardCheckpointTimeoutMs).commit_load_checkpoint();
+            }
+            controller_->apply_kv_checkpoint(std::move(checkpoint));
             MessageBody response_body;
             response_body.success = true;
             return Message::create(RequestType::LOAD_CHECKPOINT_RESPONSE, server_id(), response_body,

@@ -58,8 +58,10 @@ enum class RequestType {
 
     // Checkpoint/restore (verl's tq.save_checkpoint / tq.load_checkpoint).
     // To ControllerServer: body.address = checkpoint directory; it saves its
-    // own metadata and fans out to every shard. To StorageServer: body.address
-    // = that shard's file.
+    // own metadata and fans out to every shard, or restores the whole store
+    // all-or-nothing. To StorageServer: body.address = that shard's file, and
+    // LOAD_CHECKPOINT only *stages* it (prepare); COMMIT_/ABORT_LOAD_CHECKPOINT
+    // then swap the staged rows in or drop them.
     SAVE_CHECKPOINT,
     SAVE_CHECKPOINT_RESPONSE,
     LOAD_CHECKPOINT,
@@ -68,6 +70,12 @@ enum class RequestType {
     // Server counters for the metrics endpoint, returned as body.tags[0].
     GET_STATS,
     GET_STATS_RESPONSE,
+
+    // Second phase of a StorageServer restore (see LOAD_CHECKPOINT above).
+    COMMIT_LOAD_CHECKPOINT,
+    COMMIT_LOAD_CHECKPOINT_RESPONSE,
+    ABORT_LOAD_CHECKPOINT,
+    ABORT_LOAD_CHECKPOINT_RESPONSE,
 };
 
 std::string to_string(RequestType type);

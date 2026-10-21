@@ -81,10 +81,14 @@ public:
     std::vector<std::pair<std::string, Tag>> kv_list(const std::string& partition_id);
     void kv_clear(const std::string& partition_id, const std::vector<std::string>& keys);
 
-    // Controller: path is a checkpoint directory (it fans out to the shards).
-    // StorageServer: path is that shard's file.
+    // Controller: path is a checkpoint directory; it fans out to the shards and
+    // restores all-or-nothing. StorageServer: path is that shard's file, and
+    // load_checkpoint only stages it -- commit_load_checkpoint() swaps it in,
+    // abort_load_checkpoint() drops it.
     void save_checkpoint(const std::string& path);
     void load_checkpoint(const std::string& path);
+    void commit_load_checkpoint();
+    void abort_load_checkpoint();
 
     Tag get_stats();  // the server's counters/gauges (see RpcServerBase::request_stats)
 

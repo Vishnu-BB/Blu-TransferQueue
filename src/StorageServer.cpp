@@ -63,17 +63,30 @@ Message StorageServer::handle_request(const Message& request) {
         }
 
         case RequestType::SAVE_CHECKPOINT:
-        case RequestType::LOAD_CHECKPOINT: {
-            const bool save = request.request_type == RequestType::SAVE_CHECKPOINT;
-            if (save) {
-                storage_->save(body.address);
-            } else {
-                storage_->load(body.address);
+        case RequestType::LOAD_CHECKPOINT:
+        case RequestType::COMMIT_LOAD_CHECKPOINT:
+        case RequestType::ABORT_LOAD_CHECKPOINT: {
+            RequestType reply = RequestType::SAVE_CHECKPOINT_RESPONSE;
+            switch (request.request_type) {
+                case RequestType::SAVE_CHECKPOINT:
+                    storage_->save(body.address);
+                    break;
+                case RequestType::LOAD_CHECKPOINT:  // stage only; the controller commits once every shard staged
+                    storage_->prepare_load(body.address);
+                    reply = RequestType::LOAD_CHECKPOINT_RESPONSE;
+                    break;
+                case RequestType::COMMIT_LOAD_CHECKPOINT:
+                    storage_->commit_load();
+                    reply = RequestType::COMMIT_LOAD_CHECKPOINT_RESPONSE;
+                    break;
+                default:
+                    storage_->abort_load();
+                    reply = RequestType::ABORT_LOAD_CHECKPOINT_RESPONSE;
+                    break;
             }
             MessageBody response_body;
             response_body.success = true;
-            return Message::create(save ? RequestType::SAVE_CHECKPOINT_RESPONSE : RequestType::LOAD_CHECKPOINT_RESPONSE,
-                                   server_id(), response_body, request.sender_id);
+            return Message::create(reply, server_id(), response_body, request.sender_id);
         }
 
         case RequestType::GET_STATS: {

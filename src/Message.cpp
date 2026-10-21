@@ -49,6 +49,10 @@ std::string to_string(RequestType type) {
         case RequestType::LOAD_CHECKPOINT_RESPONSE: return "LOAD_CHECKPOINT_RESPONSE";
         case RequestType::GET_STATS: return "GET_STATS";
         case RequestType::GET_STATS_RESPONSE: return "GET_STATS_RESPONSE";
+        case RequestType::COMMIT_LOAD_CHECKPOINT: return "COMMIT_LOAD_CHECKPOINT";
+        case RequestType::COMMIT_LOAD_CHECKPOINT_RESPONSE: return "COMMIT_LOAD_CHECKPOINT_RESPONSE";
+        case RequestType::ABORT_LOAD_CHECKPOINT: return "ABORT_LOAD_CHECKPOINT";
+        case RequestType::ABORT_LOAD_CHECKPOINT_RESPONSE: return "ABORT_LOAD_CHECKPOINT_RESPONSE";
     }
     throw std::invalid_argument("to_string(RequestType): unknown value");
 }
@@ -70,7 +74,7 @@ std::uint8_t read_u8(const std::uint8_t* data, std::size_t size, std::size_t& of
 
 RequestType read_request_type(const std::uint8_t* data, std::size_t size, std::size_t& offset) {
     std::uint8_t value = read_u8(data, size, offset);
-    if (value > static_cast<std::uint8_t>(RequestType::GET_STATS_RESPONSE)) {
+    if (value > static_cast<std::uint8_t>(RequestType::ABORT_LOAD_CHECKPOINT_RESPONSE)) {
         throw std::invalid_argument("Message::deserialize: invalid request_type byte");
     }
     return static_cast<RequestType>(value);

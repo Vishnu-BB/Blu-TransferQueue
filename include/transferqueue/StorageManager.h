@@ -46,10 +46,19 @@ public:
         return true;
     }
 
-    // Checkpoint: write every stored row to `path` / replace all rows with
-    // the ones in `path`.
+    // Checkpoint: write every stored row to `path`.
     virtual void save(const std::string& path) const = 0;
-    virtual void load(const std::string& path) = 0;
+    // Two-phase restore, so a deployment can be restored all-or-nothing:
+    // prepare_load parses `path` into a staging area and validates it without
+    // touching the live rows; commit_load swaps the staged rows in (cannot
+    // fail once prepared); abort_load drops them.
+    virtual void prepare_load(const std::string& path) = 0;
+    virtual void commit_load() = 0;
+    virtual void abort_load() = 0;
+    void load(const std::string& path) {
+        prepare_load(path);
+        commit_load();
+    }
 
     // Gauges for the metrics endpoint (e.g. bytes, rows).
     virtual Tag stats() const { return {}; }
@@ -66,7 +75,19 @@ public:
     void clear_data(const BatchMeta& meta) override;
 
     void save(const std::string& path) const override;
-    void load(const std::string& path) override;
+
+    // Parses one shard checkpoint file (shard-<i>.tqsh) without loading it
+    // anywhere: partition -> sample id -> fields, plus total tensor bytes.
+    // Used by prepare_load and by tools/checkpoint_inspect_main.cpp.
+    struct ShardFile {
+        std::unordered_map<std::string, std::unordered_map<SampleId, Record>> rows;
+        std::size_t bytes = 0;
+    };
+    static ShardFile read_shard_file(const std::string& path);
+
+    void prepare_load(const std::string& path) override;
+    void commit_load() override;
+    void abort_load() override;
     Tag stats() const override;  // bytes, rows, capacity_bytes
 
     std::size_t current_bytes() const;
@@ -78,6 +99,11 @@ private:
     std::size_t capacity_bytes_;
     std::size_t current_bytes_ = 0;
     std::unordered_map<std::string, std::unordered_map<SampleId, Record>> rows_;
+    struct Staged {
+        std::unordered_map<std::string, std::unordered_map<SampleId, Record>> rows;
+        std::size_t bytes = 0;
+    };
+    std::optional<Staged> staged_;  // set between prepare_load and commit_load/abort_load
 
     mutable std::mutex mutex_;
     std::condition_variable space_available_;

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "transferqueue/DataPartitionStatus.h"
+#include "transferqueue/Message.h"
 #include "transferqueue/PartitionIndexManager.h"
 #include "transferqueue/Sampler.h"
 
@@ -91,11 +92,24 @@ public:
     std::vector<std::pair<std::string, std::size_t>> kv_partition_counts() const;  // partition -> live keys
 
     // Checkpoint of the KV metadata (keys, ids, tags, shard, version, produced
-    // fields per sample, plus the global version). Load replaces every
-    // partition. Samples written through the non-KV put/get path are not
-    // included. Callers pause writers around a save, as verl does at a step boundary.
+    // fields per sample, the global version, and the shard indices registered
+    // at save time). Samples written through the non-KV put/get path are not
+    // included.
     void save_kv_checkpoint(const std::string& path) const;
-    void load_kv_checkpoint(const std::string& path);
+
+    // A parsed checkpoint, held in memory until it is applied. Parsing reads
+    // and validates the whole file without touching the controller, so a bad
+    // file can be rejected before anything (controller or shards) changes.
+    struct KVCheckpoint {
+        std::int64_t version = 0;
+        std::vector<std::int32_t> shard_indices;  // shards registered when it was saved
+        std::vector<Message> records;
+    };
+    static KVCheckpoint parse_kv_checkpoint(const std::string& path);
+    // Replaces every partition with the checkpoint's contents. Cannot fail on a
+    // successfully parsed checkpoint.
+    void apply_kv_checkpoint(KVCheckpoint checkpoint);
+    void load_kv_checkpoint(const std::string& path) { apply_kv_checkpoint(parse_kv_checkpoint(path)); }
     std::size_t max_kv_samples() const { return max_kv_samples_; }
 
 private:

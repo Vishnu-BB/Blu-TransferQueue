@@ -1,13 +1,12 @@
 #include "transferqueue/Controller.h"
 
-#include "transferqueue/Message.h"
-
 #include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <tuple>
 #include <unordered_set>
@@ -383,7 +382,7 @@ TransferQueueController::ClearedSamples TransferQueueController::kv_clear(const 
 
 namespace {
 constexpr char kCheckpointMagic[4] = {'T', 'Q', 'C', 'K'};
-constexpr std::uint32_t kCheckpointFormat = 1;
+constexpr std::uint32_t kCheckpointFormat = 2;  // 2: adds the shard index list
 
 template <typename T>
 void write_pod(std::ostream& os, const T& v) {
@@ -403,9 +402,15 @@ void TransferQueueController::save_kv_checkpoint(const std::string& path) const 
     // trajectory rows each collapse into a handful of records.
     std::vector<std::vector<std::uint8_t>> records;
     std::int64_t version = 0;
+    std::vector<std::int32_t> shard_indices;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         version = current_version_;
+        for (const auto& [shard, address] : shard_registry_) {
+            (void)address;
+            shard_indices.push_back(shard);
+        }
+        std::sort(shard_indices.begin(), shard_indices.end());
         for (const auto& [partition_id, partition] : partitions_) {
             std::map<std::vector<std::string>, MessageBody> groups;
             for (auto& snap : partition.kv_snapshot()) {
@@ -433,6 +438,8 @@ void TransferQueueController::save_kv_checkpoint(const std::string& path) const 
         os.write(kCheckpointMagic, 4);
         write_pod(os, kCheckpointFormat);
         write_pod(os, version);
+        write_pod(os, static_cast<std::uint32_t>(shard_indices.size()));
+        for (std::int32_t shard : shard_indices) write_pod(os, shard);
         write_pod(os, static_cast<std::uint32_t>(records.size()));
         for (const auto& rec : records) {
             write_pod(os, static_cast<std::uint64_t>(rec.size()));
@@ -443,7 +450,7 @@ void TransferQueueController::save_kv_checkpoint(const std::string& path) const 
     std::filesystem::rename(tmp, path);
 }
 
-void TransferQueueController::load_kv_checkpoint(const std::string& path) {
+TransferQueueController::KVCheckpoint TransferQueueController::parse_kv_checkpoint(const std::string& path) {
     std::ifstream is(path, std::ios::binary);
     if (!is) throw std::runtime_error("load_kv_checkpoint: cannot open " + path);
     char magic[4];
@@ -454,31 +461,46 @@ void TransferQueueController::load_kv_checkpoint(const std::string& path) {
     if (read_pod<std::uint32_t>(is) != kCheckpointFormat) {
         throw std::runtime_error("load_kv_checkpoint: unsupported checkpoint format in " + path);
     }
-    const auto version = read_pod<std::int64_t>(is);
+    KVCheckpoint checkpoint;
+    checkpoint.version = read_pod<std::int64_t>(is);
+    const auto num_shards = read_pod<std::uint32_t>(is);
+    for (std::uint32_t i = 0; i < num_shards; ++i) checkpoint.shard_indices.push_back(read_pod<std::int32_t>(is));
     const auto count = read_pod<std::uint32_t>(is);
-    std::vector<Message> records;
-    records.reserve(count);
+    checkpoint.records.reserve(count);
     for (std::uint32_t i = 0; i < count; ++i) {
         const auto len = read_pod<std::uint64_t>(is);
         std::vector<std::uint8_t> bytes(len);
         is.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(len));
         if (!is) throw std::runtime_error("load_kv_checkpoint: truncated checkpoint file");
-        records.push_back(Message::deserialize(bytes));
+        checkpoint.records.push_back(Message::deserialize(bytes));
     }
+    // Every shard a sample lives on must be one the checkpoint says it saved.
+    const std::set<std::int32_t> saved(checkpoint.shard_indices.begin(), checkpoint.shard_indices.end());
+    for (const auto& rec : checkpoint.records) {
+        for (std::int32_t shard : rec.body.sample_shard_indices) {
+            if (shard >= 0 && !saved.count(shard)) {
+                throw std::runtime_error("load_kv_checkpoint: " + path + " references shard " + std::to_string(shard) +
+                                         " that it did not save");
+            }
+        }
+    }
+    return checkpoint;
+}
 
+void TransferQueueController::apply_kv_checkpoint(KVCheckpoint checkpoint) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& [partition_id, partition] : partitions_) {
         (void)partition;
         index_manager_.release_partition(partition_id);
     }
     partitions_.clear();
-    current_version_ = version;
+    current_version_ = checkpoint.version;
     // Claim every restored id before any partition is created: creating one
     // pre-allocates an id, which must never be one we're about to restore.
-    for (const auto& rec : records) {
+    for (const auto& rec : checkpoint.records) {
         index_manager_.adopt_indexes(rec.body.partition_id, rec.body.sample_ids);
     }
-    for (const auto& rec : records) {
+    for (const auto& rec : checkpoint.records) {
         const auto& body = rec.body;
         ensure_partition_locked(body.partition_id);
         auto* partition = find_partition(body.partition_id);
