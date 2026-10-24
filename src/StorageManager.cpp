@@ -102,24 +102,36 @@ bool SimpleStorageManager::put_impl(const BatchMeta& meta, const std::unordered_
     // batch has thousands of (sample, field) pairs (every real PUT).
     std::unordered_set<std::string> wanted_fields(meta.fields.begin(), meta.fields.end());
 
-    std::size_t incoming_bytes = 0;
+    std::unique_lock<std::mutex> lock(mutex_);
+    std::size_t net_new_bytes = 0;
     for (const auto& [id, record] : data) {
-        (void)id;
+        auto partition_it = rows_.find(partition_of.at(id));
         for (const auto& [field, value] : record) {
             if (wanted_fields.count(field) != 0) {
-                incoming_bytes += value.nbytes();
+                std::size_t existing_bytes = 0;
+                if (partition_it != rows_.end()) {
+                    auto row_it = partition_it->second.find(id);
+                    if (row_it != partition_it->second.end()) {
+                        auto f_it = row_it->second.find(field);
+                        if (f_it != row_it->second.end()) {
+                            existing_bytes = f_it->second.nbytes();
+                        }
+                    }
+                }
+                if (value.nbytes() > existing_bytes) {
+                    net_new_bytes += (value.nbytes() - existing_bytes);
+                }
             }
         }
     }
 
-    std::unique_lock<std::mutex> lock(mutex_);
     if (capacity_bytes_ > 0) {
-        if (incoming_bytes > capacity_bytes_) {
+        if (net_new_bytes > capacity_bytes_) {
             throw std::invalid_argument("SimpleStorageManager::put_data: batch of " +
-                                         std::to_string(incoming_bytes) + " bytes exceeds total capacity of " +
+                                         std::to_string(net_new_bytes) + " net bytes exceeds total capacity of " +
                                          std::to_string(capacity_bytes_) + " bytes -- can never fit, even empty");
         }
-        auto fits = [&] { return current_bytes_ + incoming_bytes <= capacity_bytes_; };
+        auto fits = [&] { return current_bytes_ + net_new_bytes <= capacity_bytes_; };
         if (!wait && !fits()) {
             return false;
         }
