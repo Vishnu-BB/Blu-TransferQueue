@@ -87,6 +87,8 @@ public:
     // and frees their ids; the caller still has to clear the returned samples'
     // data on their shards.
     ClearedSamples kv_clear(const std::string& partition_id, const std::vector<std::string>& keys);
+    // Return kv_clear's ids to the free list -- only once their shard rows are cleared.
+    void release_cleared(const std::string& partition_id, std::vector<SampleId> ids);
 
     std::size_t kv_sample_count() const;  // live keys across every partition
     std::vector<std::pair<std::string, std::size_t>> kv_partition_counts() const;  // partition -> live keys

@@ -422,6 +422,9 @@ Message ControllerServer::handle_request(const Message& request) {
             // their data is being removed from the shards.
             auto cleared = controller_->kv_clear(body.partition_id, body.keys);
             auto error = clear_on_shards(*controller_, server_id(), body.partition_id, cleared);
+            // Ids become reusable only now that their shard rows are gone. If a shard could not be
+            // cleared, keep its ids out of the free list rather than hand out a dirty row.
+            if (error.empty()) controller_->release_cleared(body.partition_id, cleared.sample_ids);
 
             MessageBody response_body;
             response_body.success = error.empty();

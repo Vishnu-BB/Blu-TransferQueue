@@ -419,6 +419,7 @@ int main() {
         CHECK(controller.kv_retrieve("train", {"a"}, false)[0] == tq::kMissingSample);
         CHECK(controller.kv_list("train").size() == 1);
         CHECK(controller.ready_indexes("train", {"responses"}, "t").empty());
+        controller.release_cleared("train", cleared.sample_ids);  // what KV_CLEAR does after the shards
 
         // A cleared key comes back as a brand-new, tag-less row.
         auto again = controller.kv_retrieve("train", {"a"}, true);

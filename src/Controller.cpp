@@ -376,8 +376,18 @@ TransferQueueController::ClearedSamples TransferQueueController::kv_clear(const 
     std::sort(unique_ids.begin(), unique_ids.end());
     unique_ids.erase(std::unique(unique_ids.begin(), unique_ids.end()), unique_ids.end());
     partition->clear_data(unique_ids, /*clear_consumption=*/true);
-    index_manager_.release_indexes(partition_id, unique_ids);
+    // The ids are NOT released here: their rows still sit on the storage shards until the caller
+    // clears them (ControllerServer KV_CLEAR), then calls release_cleared(). Releasing first let a
+    // concurrent kv_put reuse an id, write the new key's row into it, and have the pending shard
+    // clear wipe that row (or merge into the old one) -- rows with missing or foreign fields.
     return result;
+}
+
+void TransferQueueController::release_cleared(const std::string& partition_id, std::vector<SampleId> ids) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    if (!ids.empty()) index_manager_.release_indexes(partition_id, ids);
 }
 
 namespace {
